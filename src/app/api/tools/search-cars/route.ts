@@ -19,24 +19,34 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { query, filters = {}, limit = 5 } = body;
+  const {
+    query,
+    limit = 5,
+    status,
+    make,
+    model,
+    year_min,
+    year_max,
+    min_price,
+    max_price,
+    has_video,
+    video_posted_within_days,
+  } = body;
 
-  if (typeof limit !== "number" || typeof filters !== "object") {
+  if (typeof limit !== "number") {
     return NextResponse.json({ error: "Invalid parameters" }, { status: 400 });
   }
 
   const conditions: ReturnType<typeof eq>[] = [];
 
-  // Status filter (default: available)
-  conditions.push(eq(cars.status, filters.status || "available"));
+  conditions.push(eq(cars.status, status || "available"));
 
-  // Structured filters
-  if (filters.make) conditions.push(ilike(cars.make, `%${String(filters.make).replace(/%/g, "")}%`));
-  if (filters.model) conditions.push(ilike(cars.model, `%${String(filters.model).replace(/%/g, "")}%`));
-  if (filters.year_min) conditions.push(gte(cars.year, Number(filters.year_min)));
-  if (filters.year_max) conditions.push(lte(cars.year, Number(filters.year_max)));
-  if (filters.min_price) conditions.push(gte(cars.price, Number(filters.min_price)));
-  if (filters.max_price) conditions.push(lte(cars.price, Number(filters.max_price)));
+  if (make) conditions.push(ilike(cars.make, `%${String(make).replace(/%/g, "")}%`));
+  if (model) conditions.push(ilike(cars.model, `%${String(model).replace(/%/g, "")}%`));
+  if (year_min) conditions.push(gte(cars.year, Number(year_min)));
+  if (year_max) conditions.push(lte(cars.year, Number(year_max)));
+  if (min_price) conditions.push(gte(cars.price, Number(min_price)));
+  if (max_price) conditions.push(lte(cars.price, Number(max_price)));
 
   // Build the query
   const clampedLimit = Math.min(Math.max(Number(limit) || 5, 1), 20);
@@ -124,10 +134,10 @@ export async function POST(request: NextRequest) {
     )[0];
 
     // Filter by video criteria if needed
-    if (filters.has_video && videos.length === 0) return null;
-    if (filters.video_posted_within_days && latestVideo) {
+    if (has_video && videos.length === 0) return null;
+    if (video_posted_within_days && latestVideo) {
       const daysAgo = new Date();
-      daysAgo.setDate(daysAgo.getDate() - filters.video_posted_within_days);
+      daysAgo.setDate(daysAgo.getDate() - video_posted_within_days);
       if (new Date(latestVideo.posted_at) < daysAgo) return null;
     }
 
