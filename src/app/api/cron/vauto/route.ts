@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { processVautoFile } from "@/lib/vauto";
+import { auth } from "@/lib/auth";
+import { headers } from "next/headers";
 import fs from "fs";
 import path from "path";
 
@@ -7,11 +9,16 @@ const UPLOAD_DIR = process.env.VAUTO_UPLOAD_DIR || "/home/vauto/uploads";
 const MAX_CSV_SIZE = 50 * 1024 * 1024; // 50MB
 
 export async function POST(request: NextRequest) {
-  // Auth required — fail closed
   const authHeader = request.headers.get("authorization");
   const apiKey = process.env.TOOL_API_KEY;
-  if (!apiKey || authHeader !== `Bearer ${apiKey}`) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const bearerOk = apiKey && authHeader === `Bearer ${apiKey}`;
+
+  if (!bearerOk) {
+    const reqHeaders = await headers();
+    const session = await auth.api.getSession({ headers: reqHeaders });
+    if (!session || session.user.role !== "admin") {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
   }
 
   try {

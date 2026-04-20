@@ -79,7 +79,7 @@ export default function VautoPage() {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
           <div>
             <span className="text-muted-foreground">Host</span>
-            <p className="font-mono mt-1">saliba.kejue.co</p>
+            <p className="font-mono mt-1">sftp.jsautohaus.kejue.co</p>
           </div>
           <div>
             <span className="text-muted-foreground">Port</span>
@@ -95,7 +95,7 @@ export default function VautoPage() {
           </div>
           <div>
             <span className="text-muted-foreground">Schedule</span>
-            <p className="mt-1">Daily at 1:00 AM EST (pickup at 1:30 AM)</p>
+            <p className="mt-1">4x daily: 6:00 AM, 12:00 PM, 6:00 PM, 12:00 AM (CT)</p>
           </div>
           <div>
             <span className="text-muted-foreground">File Format</span>
