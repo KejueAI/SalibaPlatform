@@ -30,11 +30,21 @@ import {
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+// Kejue's `call.analyzed` envelope. The shape that arrives from the test-webhook
+// button on the Kejue dashboard is a superset of what the public docs describe,
+// so we accept both:
+//   - `call.structured_data` (docs) OR `call.extracted_data` (test webhook)
+//   - `contact.name` (docs) OR `contact.first_name`/`last_name`/`full_name` (test webhook)
+//   - `contact.status` may be a string (docs) or a nested object (test webhook)
 interface KejueContact {
   id: string;
   name?: string;
+  full_name?: string;
+  first_name?: string;
+  last_name?: string;
   phone?: string;
   email?: string;
+  status?: string | { status?: string; score?: number };
 }
 
 interface KejueCallAnalyzedData {
@@ -46,6 +56,7 @@ interface KejueCallAnalyzedData {
     score?: number;
     duration_seconds?: number;
     structured_data?: Record<string, unknown>;
+    extracted_data?: Record<string, unknown>;
   };
   contact: KejueContact;
   conversation?: {
@@ -123,6 +134,38 @@ function callLogUrl(callId: string): string {
   return `https://app.kejue.co/logs?call=${encodeURIComponent(callId)}`;
 }
 
+// DriveCentric's Customer Phones validator only accepts 10 raw digits
+// (`xxxxxxxxxx`) — Kejue sends E.164 (`+15551234567`). Strip everything
+// non-numeric and keep the last 10 digits. Returns null if we can't form
+// a valid 10-digit number, in which case we omit the phone entirely
+// (better than failing the whole upsert).
+function normalizePhoneForDc(phone: string | undefined): string | null {
+  if (!phone) return null;
+  const last10 = phone.replace(/\D/g, "").slice(-10);
+  return last10.length === 10 ? last10 : null;
+}
+
+// Best-effort first/last name resolution that prefers, in order:
+//   1. agent-extracted fields (structured_data.customer_first_name / _last_name)
+//   2. Kejue's split contact fields (contact.first_name / contact.last_name)
+//   3. splitting contact.full_name or contact.name
+function resolveName(
+  contact: KejueContact,
+  structured: Record<string, unknown>
+): { firstName: string; lastName: string } {
+  const fn =
+    str(structured.customer_first_name) ?? str(contact.first_name);
+  const ln =
+    str(structured.customer_last_name) ?? str(contact.last_name);
+  if (fn && ln) return { firstName: fn, lastName: ln };
+
+  const split = splitName(contact.full_name ?? contact.name);
+  return {
+    firstName: fn ?? split.firstName,
+    lastName: ln ?? split.lastName,
+  };
+}
+
 // ─── Customer lookup ─────────────────────────────────────────────────────────
 
 async function findExistingCustomerId(
@@ -149,18 +192,12 @@ async function findExistingCustomerId(
     if (hits.length > 0) return hits[0].id;
   }
 
-  // 3) First + last name.
-  const fn = str(structured.customer_first_name);
-  const ln = str(structured.customer_last_name);
-  if (fn && ln) {
-    const hits = await searchCustomers({ firstName: fn, lastName: ln });
+  // 3) First + last name. Prefer Kejue's split fields, then fall back to
+  //    splitting contact.full_name / contact.name.
+  const { firstName, lastName } = resolveName(contact, structured);
+  if (firstName !== "Unknown" && lastName !== "Unknown") {
+    const hits = await searchCustomers({ firstName, lastName });
     if (hits.length > 0) return hits[0].id;
-  } else if (contact.name) {
-    const { firstName, lastName } = splitName(contact.name);
-    if (firstName !== "Unknown" && lastName !== "Unknown") {
-      const hits = await searchCustomers({ firstName, lastName });
-      if (hits.length > 0) return hits[0].id;
-    }
   }
 
   return null;
@@ -191,10 +228,9 @@ function buildDealPayload(opts: {
     salespersonCrmId,
   } = opts;
 
-  // Customer name — prefer extracted fields, fall back to splitting contact.name.
-  const split = splitName(contact.name);
-  const firstName = str(structured.customer_first_name) ?? split.firstName;
-  const lastName = str(structured.customer_last_name) ?? split.lastName;
+  // Customer name — prefer agent-extracted fields, then Kejue's split contact
+  // fields, then split contact.full_name / contact.name.
+  const { firstName, lastName } = resolveName(contact, structured);
   const email = str(structured.customer_email) ?? contact.email;
 
   const stageKey = String(structured.lead_quality ?? "").toLowerCase();
@@ -209,8 +245,11 @@ function buildDealPayload(opts: {
     customerIdentifiers.unshift({ type: "CrmId", value: existingCustomerCrmId });
   }
 
+  // DriveCentric requires phones in 10-digit format (xxxxxxxxxx). Drop the
+  // phone if we can't normalize cleanly rather than failing the whole upsert.
+  const dcPhone = normalizePhoneForDc(contact.phone);
   const phones: NonNullable<DcDealPayload["deal"]["customers"][number]["phones"]> =
-    contact.phone ? [{ type: "Mobile", value: contact.phone }] : [];
+    dcPhone ? [{ type: "Mobile", value: dcPhone }] : [];
   const emails: NonNullable<DcDealPayload["deal"]["customers"][number]["emails"]> =
     email ? [{ type: "Home", value: email }] : [];
 
@@ -380,7 +419,11 @@ async function syncCallToCrm(
     throw new Error("Missing data.contact in payload");
   }
 
-  const structured = (data.call.structured_data ?? {}) as Record<string, unknown>;
+  // The Kejue test-webhook payload uses `extracted_data`; the public docs
+  // call the same field `structured_data`. Accept either.
+  const structured = (data.call.structured_data ??
+    data.call.extracted_data ??
+    {}) as Record<string, unknown>;
   const callId = data.call.id;
   const conversationId = data.conversation?.id ?? callId;
   const partnerKey = conversationId; // stable key so retries hit the same deal/customer
