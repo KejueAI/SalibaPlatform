@@ -61,16 +61,33 @@ function InventoryPage() {
     fetchCars();
   }, [fetchCars]);
 
-  function updateParams(key: string, value: string) {
-    const params = new URLSearchParams(searchParams.toString());
-    if (value) {
-      params.set(key, value);
-    } else {
-      params.delete(key);
-    }
-    if (key !== "page") params.set("page", "1");
-    router.push(`/dashboard/inventory?${params}`);
-  }
+  const updateParams = useCallback(
+    (key: string, value: string) => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (value) {
+        params.set(key, value);
+      } else {
+        params.delete(key);
+      }
+      if (key !== "page") params.set("page", "1");
+      router.push(`/dashboard/inventory?${params}`);
+    },
+    [router, searchParams]
+  );
+
+  const [searchInput, setSearchInput] = useState(search);
+
+  useEffect(() => {
+    setSearchInput(search);
+  }, [search]);
+
+  useEffect(() => {
+    if (searchInput === search) return;
+    const timeout = setTimeout(() => {
+      updateParams("search", searchInput);
+    }, 400);
+    return () => clearTimeout(timeout);
+  }, [searchInput, search, updateParams]);
 
   const statusColor = (s: string) => {
     switch (s) {
@@ -112,13 +129,8 @@ function InventoryPage() {
           />
           <Input
             placeholder="Search make, model, stock ID..."
-            defaultValue={search}
-            onChange={(e) => {
-              const timeout = setTimeout(() => {
-                updateParams("search", e.target.value);
-              }, 400);
-              return () => clearTimeout(timeout);
-            }}
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
             className="pl-10 bg-background/50"
           />
         </div>
