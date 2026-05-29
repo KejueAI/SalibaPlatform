@@ -374,9 +374,11 @@ function normalizeAppointmentType(raw: string | undefined): DcAppointmentType {
   return "TestDrive";
 }
 
-// Business timezone for "today" — the model speaks dates in the caller's day,
-// so compute the current year there (UTC drift would burn us near midnight).
-const APPOINTMENT_TZ = process.env.DRIVECENTRIC_TZ || "Asia/Dubai";
+// Store timezone — the dealership is in Ewing, New Jersey. The caller speaks
+// times in the store's local day ("5pm their time"), so every appointment
+// wall-clock is interpreted here. America/New_York observes DST, so we resolve
+// the offset per-instant rather than assuming a fixed one.
+const APPOINTMENT_TZ = process.env.DRIVECENTRIC_TZ || "America/New_York";
 
 function currentYearInTz(tz: string): number {
   return Number(
@@ -386,40 +388,66 @@ function currentYearInTz(tz: string): number {
   );
 }
 
-// Layer-3 defence against the model's training-data year bias (it confidently
-// emits e.g. 2024 when it's 2026). We never trust the year the model sent:
-// force it to the current year, and if that lands in the past, bump to next
-// year — preserving month/day/time. Month/day come from the UTC instant the
-// model provided; only the year is rewritten.
-function correctAppointmentYear(when: Date): {
-  fixed: Date;
-  corrected: boolean;
-} {
-  const buildForYear = (year: number) => {
-    const month = when.getUTCMonth();
-    const day = when.getUTCDate();
-    // Feb 29 on a non-leap year would roll over to Mar 1 via Date.UTC — clamp
-    // it to the 28th instead.
-    const isLeap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
-    const safeDay = month === 1 && day === 29 && !isLeap ? 28 : day;
-    return new Date(
-      Date.UTC(
-        year,
-        month,
-        safeDay,
-        when.getUTCHours(),
-        when.getUTCMinutes(),
-        when.getUTCSeconds()
-      )
-    );
-  };
+// Offset (ms) of `tz` from UTC at the given instant, DST-aware.
+function tzOffsetMs(at: Date, tz: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(at);
+  const m: Record<string, number> = {};
+  for (const p of parts) if (p.type !== "literal") m[p.type] = Number(p.value);
+  const asUTC = Date.UTC(m.year, m.month - 1, m.day, m.hour, m.minute, m.second);
+  return asUTC - at.getTime();
+}
 
-  const thisYear = currentYearInTz(APPOINTMENT_TZ);
-  let fixed = buildForYear(thisYear);
-  if (fixed.getTime() <= Date.now()) {
-    fixed = buildForYear(thisYear + 1);
-  }
-  return { fixed, corrected: fixed.getTime() !== when.getTime() };
+// Treat (year, month, day, hour, minute) as a wall-clock time in `tz` and
+// return the corresponding UTC instant. Two passes settle the DST offset.
+function wallClockToInstant(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  tz: string
+): Date {
+  const guess = Date.UTC(year, month, day, hour, minute, 0);
+  let offset = tzOffsetMs(new Date(guess), tz);
+  offset = tzOffsetMs(new Date(guess - offset), tz);
+  return new Date(guess - offset);
+}
+
+interface WallClock {
+  year: number;
+  month: number; // 0-based
+  day: number;
+  hour: number;
+  minute: number;
+  hadTime: boolean;
+}
+
+// Pull the literal wall-clock the model typed, ignoring any trailing Z/offset.
+// The model is unreliable about timezones (it appends "Z" to local times), so
+// we trust only the digits and re-bind them to the store timezone ourselves.
+function parseWallClock(raw: string): WallClock | null {
+  const m = raw
+    .trim()
+    .match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T ](\d{1,2}):(\d{2})(?::\d{2})?)?/);
+  if (!m) return null;
+  const hadTime = m[4] !== undefined;
+  return {
+    year: Number(m[1]),
+    month: Number(m[2]) - 1,
+    day: Number(m[3]),
+    hour: hadTime ? Number(m[4]) : 12, // default to noon if no time given
+    minute: hadTime ? Number(m[5]) : 0,
+    hadTime,
+  };
 }
 
 function planAppointment(
@@ -433,19 +461,38 @@ function planAppointment(
   if (!raw) {
     return { ok: false, reason: "wants_appointment=true but appointment_datetime is missing" };
   }
-  const when = new Date(raw);
-  if (Number.isNaN(when.getTime())) {
+  const wall = parseWallClock(raw);
+  if (!wall) {
     return { ok: false, reason: `appointment_datetime is unparseable: ${raw}` };
   }
 
-  // Don't reject a past date — the model's year is untrustworthy. Force it to
-  // the current year (or next year if that's still past) and log the fix.
-  const { fixed, corrected } = correctAppointmentYear(when);
-  if (corrected) {
-    console.warn(
-      `[add-to-crm] appointment: corrected year ${when.toISOString()} -> ${fixed.toISOString()} (model year bias)`
+  // Build the instant, interpreting the wall-clock in the store timezone.
+  // Force the year (model has a training-data year bias) to the current year,
+  // bumping to next year if that lands in the past. Feb-29 clamps to the 28th.
+  const buildForYear = (year: number) => {
+    const isLeap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    const day = wall.month === 1 && wall.day === 29 && !isLeap ? 28 : wall.day;
+    return wallClockToInstant(
+      year,
+      wall.month,
+      day,
+      wall.hour,
+      wall.minute,
+      APPOINTMENT_TZ
     );
+  };
+
+  const thisYear = currentYearInTz(APPOINTMENT_TZ);
+  let fixed = buildForYear(thisYear);
+  if (fixed.getTime() <= Date.now()) {
+    fixed = buildForYear(thisYear + 1);
   }
+
+  console.log(
+    `[add-to-crm] appointment: interpreted "${raw}" as ${wall.year}-${String(wall.month + 1).padStart(2, "0")}-${String(wall.day).padStart(2, "0")} ${String(wall.hour).padStart(2, "0")}:${String(wall.minute).padStart(2, "0")} ${APPOINTMENT_TZ}` +
+      (wall.hadTime ? "" : " (no time given, defaulted to noon)") +
+      ` -> ${fixed.toISOString()}`
+  );
 
   return {
     ok: true,
