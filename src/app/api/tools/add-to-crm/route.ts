@@ -359,29 +359,52 @@ interface PlannedAppointment {
   notes?: string;
 }
 
+type AppointmentPlan =
+  | { ok: true; appointment: PlannedAppointment }
+  | { ok: false; reason: string };
+
+// Match the agent's free-form appointment_type (e.g. "sales", "test drive")
+// to a DriveCentric enum value case-insensitively, falling back to TestDrive.
+function normalizeAppointmentType(raw: string | undefined): DcAppointmentType {
+  if (!raw) return "TestDrive";
+  const cleaned = raw.replace(/[\s_-]/g, "").toLowerCase();
+  for (const allowed of ALLOWED_APPOINTMENT_TYPES) {
+    if (allowed.toLowerCase() === cleaned) return allowed;
+  }
+  return "TestDrive";
+}
+
 function planAppointment(
   structured: Record<string, unknown>
-): PlannedAppointment | null {
-  if (!bool(structured.wants_appointment)) return null;
+): AppointmentPlan {
+  if (!bool(structured.wants_appointment)) {
+    return { ok: false, reason: "wants_appointment is not true" };
+  }
 
   const raw = str(structured.appointment_datetime);
-  if (!raw) return null;
+  if (!raw) {
+    return { ok: false, reason: "wants_appointment=true but appointment_datetime is missing" };
+  }
   const when = new Date(raw);
-  if (Number.isNaN(when.getTime())) return null;
-  if (when.getTime() <= Date.now()) return null; // API rejects past dates
-
-  const requestedType = str(structured.appointment_type) as
-    | DcAppointmentType
-    | undefined;
-  const type: DcAppointmentType =
-    requestedType && ALLOWED_APPOINTMENT_TYPES.has(requestedType)
-      ? requestedType
-      : "TestDrive";
+  if (Number.isNaN(when.getTime())) {
+    return { ok: false, reason: `appointment_datetime is unparseable: ${raw}` };
+  }
+  if (when.getTime() <= Date.now()) {
+    // API rejects past dates — surface the value so a wrong year (a common
+    // transcription error) is obvious in the logs.
+    return {
+      ok: false,
+      reason: `appointment_datetime ${when.toISOString()} is in the past — DriveCentric rejects past dates`,
+    };
+  }
 
   return {
-    type,
-    appointmentDate: when.toISOString(),
-    notes: str(structured.appointment_notes),
+    ok: true,
+    appointment: {
+      type: normalizeAppointmentType(str(structured.appointment_type)),
+      appointmentDate: when.toISOString(),
+      notes: str(structured.appointment_notes),
+    },
   };
 }
 
@@ -490,17 +513,29 @@ async function syncCallToCrm(
   let appointmentId: string | null = null;
   let appointmentSkippedReason: string | undefined;
   const planned = planAppointment(structured);
-  if (planned) {
+  if (planned.ok) {
+    console.log(
+      `[add-to-crm] appointment: creating ${planned.appointment.type} for customer ${customerId} at ${planned.appointment.appointmentDate}`
+    );
     try {
-      const appt = await createAppointment(customerId, planned);
+      const appt = await createAppointment(customerId, planned.appointment);
       appointmentId = appt.id;
     } catch (err) {
       // Don't fail the whole sync if only the appointment leg failed —
       // the customer + note are already in CRM.
       appointmentSkippedReason = (err as Error).message;
+      console.error(
+        `[add-to-crm] appointment: creation failed for customer ${customerId}: ${appointmentSkippedReason}`
+      );
     }
-  } else if (bool(structured.wants_appointment)) {
-    appointmentSkippedReason = "wants_appointment=true but no valid appointment_datetime";
+  } else {
+    appointmentSkippedReason = planned.reason;
+    // Only worth flagging loudly when the agent actually wanted an appointment.
+    if (bool(structured.wants_appointment)) {
+      console.warn(
+        `[add-to-crm] appointment: skipped for customer ${customerId} — ${planned.reason}`
+      );
+    }
   }
 
   return {
