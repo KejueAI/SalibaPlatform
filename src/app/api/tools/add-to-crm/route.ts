@@ -421,6 +421,32 @@ function tzOffsetMs(at: Date, tz: string): number {
   return asUTC - at.getTime();
 }
 
+// Format `instant` as an ISO-8601 string in `tz` WITH an explicit offset
+// (e.g. "2026-06-01T13:00:00-04:00"). DriveCentric reads the literal clock in
+// the string rather than converting from UTC, so we must send the store-local
+// wall-clock, not a "Z" UTC time. The offset keeps it unambiguous for any
+// parser (literal readers and converting readers both land on the same time).
+function toZonedIso(instant: Date, tz: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(instant);
+  const m: Record<string, string> = {};
+  for (const p of parts) if (p.type !== "literal") m[p.type] = p.value;
+  const offMs = tzOffsetMs(instant, tz); // negative west of UTC
+  const sign = offMs <= 0 ? "-" : "+";
+  const abs = Math.abs(offMs);
+  const oh = String(Math.floor(abs / 3_600_000)).padStart(2, "0");
+  const om = String(Math.floor((abs % 3_600_000) / 60_000)).padStart(2, "0");
+  return `${m.year}-${m.month}-${m.day}T${m.hour}:${m.minute}:${m.second}${sign}${oh}:${om}`;
+}
+
 // Treat (year, month, day, hour, minute) as a wall-clock time in `tz` and
 // return the corresponding UTC instant. Two passes settle the DST offset.
 function wallClockToInstant(
@@ -519,17 +545,18 @@ function planAppointment(
     };
   }
 
+  const appointmentDate = toZonedIso(fixed, APPOINTMENT_TZ);
   console.log(
     `[add-to-crm] appointment: caller asked for ${WEEKDAYS[targetDow]} ${String(wall.hour).padStart(2, "0")}:${String(wall.minute).padStart(2, "0")} (from model date "${raw}")` +
       (wall.hadTime ? "" : " — no time given, defaulted to noon") +
-      ` -> next ${WEEKDAYS[targetDow]} ${fixed.toISOString()} (${APPOINTMENT_TZ})`
+      ` -> next ${WEEKDAYS[targetDow]} ${appointmentDate} (${APPOINTMENT_TZ})`
   );
 
   return {
     ok: true,
     appointment: {
       type: normalizeAppointmentType(str(structured.appointment_type)),
-      appointmentDate: fixed.toISOString(),
+      appointmentDate,
       notes: str(structured.appointment_notes),
     },
   };
