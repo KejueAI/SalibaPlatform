@@ -380,12 +380,27 @@ function normalizeAppointmentType(raw: string | undefined): DcAppointmentType {
 // the offset per-instant rather than assuming a fixed one.
 const APPOINTMENT_TZ = process.env.DRIVECENTRIC_TZ || "America/New_York";
 
-function currentYearInTz(tz: string): number {
-  return Number(
-    new Intl.DateTimeFormat("en-US", { timeZone: tz, year: "numeric" }).format(
-      new Date()
-    )
-  );
+const WEEKDAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
+
+// Today's calendar date (year/0-based month/day) in the given timezone.
+function todayInTz(tz: string): { year: number; month: number; day: number } {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const m: Record<string, number> = {};
+  for (const p of parts) if (p.type !== "literal") m[p.type] = Number(p.value);
+  return { year: m.year, month: m.month - 1, day: m.day };
 }
 
 // Offset (ms) of `tz` from UTC at the given instant, DST-aware.
@@ -466,32 +481,48 @@ function planAppointment(
     return { ok: false, reason: `appointment_datetime is unparseable: ${raw}` };
   }
 
-  // Build the instant, interpreting the wall-clock in the store timezone.
-  // Force the year (model has a training-data year bias) to the current year,
-  // bumping to next year if that lands in the past. Feb-29 clamps to the 28th.
-  const buildForYear = (year: number) => {
-    const isLeap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
-    const day = wall.month === 1 && wall.day === 29 && !isLeap ? 28 : wall.day;
-    return wallClockToInstant(
-      year,
-      wall.month,
-      day,
+  // The model's absolute date is unreliable (training-era year bias means it
+  // emits e.g. 2024-05-20 — a Monday in 2024, but the wrong year now). What it
+  // DOES get right is the weekday the caller asked for. So we trust the
+  // weekday, not the date: take the day-of-week from the model's date and snap
+  // to the next occurrence of that weekday from today, keeping the time.
+  const targetDow = new Date(
+    Date.UTC(wall.year, wall.month, wall.day)
+  ).getUTCDay();
+
+  const today = todayInTz(APPOINTMENT_TZ);
+  // Iterate forward over calendar days (UTC midnight is a safe cursor for
+  // date-only math; the real instant is resolved per-day in the store tz).
+  const cursor = Date.UTC(today.year, today.month, today.day);
+  let fixed: Date | null = null;
+  for (let i = 0; i < 8; i++) {
+    const day = new Date(cursor + i * 86_400_000);
+    if (day.getUTCDay() !== targetDow) continue;
+    const instant = wallClockToInstant(
+      day.getUTCFullYear(),
+      day.getUTCMonth(),
+      day.getUTCDate(),
       wall.hour,
       wall.minute,
       APPOINTMENT_TZ
     );
-  };
-
-  const thisYear = currentYearInTz(APPOINTMENT_TZ);
-  let fixed = buildForYear(thisYear);
-  if (fixed.getTime() <= Date.now()) {
-    fixed = buildForYear(thisYear + 1);
+    // Skip today's slot if its time has already passed — take next week's.
+    if (instant.getTime() > Date.now()) {
+      fixed = instant;
+      break;
+    }
+  }
+  if (!fixed) {
+    return {
+      ok: false,
+      reason: `could not resolve a future ${WEEKDAYS[targetDow]} from "${raw}"`,
+    };
   }
 
   console.log(
-    `[add-to-crm] appointment: interpreted "${raw}" as ${wall.year}-${String(wall.month + 1).padStart(2, "0")}-${String(wall.day).padStart(2, "0")} ${String(wall.hour).padStart(2, "0")}:${String(wall.minute).padStart(2, "0")} ${APPOINTMENT_TZ}` +
-      (wall.hadTime ? "" : " (no time given, defaulted to noon)") +
-      ` -> ${fixed.toISOString()}`
+    `[add-to-crm] appointment: caller asked for ${WEEKDAYS[targetDow]} ${String(wall.hour).padStart(2, "0")}:${String(wall.minute).padStart(2, "0")} (from model date "${raw}")` +
+      (wall.hadTime ? "" : " — no time given, defaulted to noon") +
+      ` -> next ${WEEKDAYS[targetDow]} ${fixed.toISOString()} (${APPOINTMENT_TZ})`
   );
 
   return {
