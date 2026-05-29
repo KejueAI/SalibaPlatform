@@ -672,7 +672,17 @@ async function syncCallToCrm(
       `[add-to-crm] appointment: creating ${planned.appointment.type} for customer ${customerId} at ${planned.appointment.appointmentDate}`
     );
     try {
-      const appt = await createAppointment(customerId, planned.appointment);
+      // Assign the appointment to the default salesperson. DriveCentric
+      // validates appointment times against the assigned user's working hours,
+      // so an unassigned appointment can be rejected as "outside business
+      // hours" even for a normal slot.
+      const salespersonCrmId = process.env.DRIVECENTRIC_DEFAULT_SALESPERSON_CRM_ID;
+      const appt = await createAppointment(customerId, {
+        ...planned.appointment,
+        ...(salespersonCrmId
+          ? { scheduledForUserId: salespersonCrmId, createdByUserId: salespersonCrmId }
+          : {}),
+      });
       appointmentId = appt.id;
     } catch (err) {
       // Don't fail the whole sync if only the appointment leg failed —
