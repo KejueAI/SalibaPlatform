@@ -24,6 +24,7 @@ function ensureConfig() {
 
 async function fetchToken(): Promise<TokenCache> {
   ensureConfig();
+  console.log("[drivecentric] auth token: requesting new token");
   const res = await fetch(
     `${BASE}/api/authentication/token?api-version=${API_VERSION}`,
     {
@@ -37,6 +38,7 @@ async function fetchToken(): Promise<TokenCache> {
   );
   if (!res.ok) {
     const body = await res.text().catch(() => "");
+    console.error(`[drivecentric] auth token: failed (${res.status})`);
     throw new Error(
       `DriveCentric auth failed (${res.status}): ${body.slice(0, 300)}`
     );
@@ -47,10 +49,14 @@ async function fetchToken(): Promise<TokenCache> {
     expiresInSeconds?: number;
   };
   if (!data.idToken) {
+    console.error("[drivecentric] auth token: response missing idToken");
     throw new Error("DriveCentric auth response missing idToken");
   }
   // Default to 1h if the server didn't tell us, with a 60s safety buffer applied at read time.
   const ttl = (data.expiresInSeconds ?? 3600) * 1000;
+  console.log(
+    `[drivecentric] auth token: acquired (expires in ${Math.round(ttl / 1000)}s)`
+  );
   return { token: data.idToken, expiresAt: Date.now() + ttl };
 }
 
@@ -128,16 +134,22 @@ export async function searchCustomers(params: {
   vin?: string;
   offset?: number;
 }): Promise<DcCustomerSummary[]> {
+  console.log(
+    `[drivecentric] search customers: querying ${JSON.stringify(params)}`
+  );
   const res = await dcFetch(`/api/stores/${STORE_ID}/customers`, {
     query: params,
   });
   if (!res.ok) {
+    console.error(`[drivecentric] search customers: failed (${res.status})`);
     throw new Error(
       `DriveCentric searchCustomers failed (${res.status}): ${await readErrorBody(res)}`
     );
   }
   const data = (await res.json()) as { customers?: DcCustomerSummary[] };
-  return data.customers ?? [];
+  const customers = data.customers ?? [];
+  console.log(`[drivecentric] search customers: ${customers.length} match(es)`);
+  return customers;
 }
 
 // ─── Notes ───────────────────────────────────────────────────────────────────
@@ -151,16 +163,22 @@ export async function createNote(
   customerId: string,
   note: { description: string; pinned?: boolean; url?: string }
 ): Promise<DcCreateNoteResponse> {
+  console.log(
+    `[drivecentric] create note: customer ${customerId} (${note.description.length} chars, pinned=${note.pinned ?? false})`
+  );
   const res = await dcFetch(
     `/api/stores/${STORE_ID}/customers/${customerId}/note`,
     { method: "POST", body: note }
   );
   if (!res.ok) {
+    console.error(`[drivecentric] create note: failed (${res.status})`);
     throw new Error(
       `DriveCentric createNote failed (${res.status}): ${await readErrorBody(res)}`
     );
   }
-  return (await res.json()) as DcCreateNoteResponse;
+  const created = (await res.json()) as DcCreateNoteResponse;
+  console.log(`[drivecentric] create note: created noteId=${created.noteId}`);
+  return created;
 }
 
 // ─── Appointments ────────────────────────────────────────────────────────────
@@ -194,16 +212,24 @@ export async function createAppointment(
     createdByUserId?: string;
   }
 ): Promise<DcCreateAppointmentResponse> {
+  console.log(
+    `[drivecentric] create appointment: customer ${customerId}, type=${appt.type}, date=${appt.appointmentDate}`
+  );
   const res = await dcFetch(
     `/api/stores/${STORE_ID}/customers/${customerId}/appointment`,
     { method: "POST", body: appt }
   );
   if (!res.ok) {
+    console.error(`[drivecentric] create appointment: failed (${res.status})`);
     throw new Error(
       `DriveCentric createAppointment failed (${res.status}): ${await readErrorBody(res)}`
     );
   }
-  return (await res.json()) as DcCreateAppointmentResponse;
+  const created = (await res.json()) as DcCreateAppointmentResponse;
+  console.log(
+    `[drivecentric] create appointment: created id=${created.id}`
+  );
+  return created;
 }
 
 // ─── Deals (upsert) ──────────────────────────────────────────────────────────
@@ -302,16 +328,25 @@ export interface DcUpsertDealResponse {
 export async function upsertDeal(
   payload: DcDealPayload
 ): Promise<DcUpsertDealResponse> {
+  const dealCrmId = findIdentifier(payload.deal.identifiers, "CrmId");
+  console.log(
+    `[drivecentric] upsert deal: ${payload.deal.customers.length} customer(s), stage=${payload.deal.stage ?? "n/a"}, crmId=${dealCrmId ?? "new"}`
+  );
   const res = await dcFetch(`/api/stores/${STORE_ID}/deal/upsert`, {
     method: "POST",
     body: payload,
   });
   if (!res.ok) {
+    console.error(`[drivecentric] upsert deal: failed (${res.status})`);
     throw new Error(
       `DriveCentric upsertDeal failed (${res.status}): ${await readErrorBody(res)}`
     );
   }
-  return (await res.json()) as DcUpsertDealResponse;
+  const result = (await res.json()) as DcUpsertDealResponse;
+  console.log(
+    `[drivecentric] upsert deal: ok, dealId=${findIdentifier(result.deal?.identifiers, "CrmId") ?? "unknown"}`
+  );
+  return result;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
