@@ -402,6 +402,7 @@ interface SyncResult {
   customerId: string;
   dealId: string | null;
   noteId: string | null;
+  noteSkippedReason?: string;
   appointmentId: string | null;
   matchedStockId: string | null;
   newCustomer: boolean;
@@ -467,11 +468,23 @@ async function syncCallToCrm(
   const dealId = findIdentifier(upsertResp.deal?.identifiers, "CrmId");
 
   // Note: includes the Kejue call-log URL via the {Url} placeholder.
-  const note = await createNote(customerId, {
-    description: buildNoteDescription(data.call),
-    url: callLogUrl(callId),
-    pinned: String(structured.lead_quality ?? "").toLowerCase() === "hot",
-  });
+  // Don't fail the whole sync if the note leg fails (e.g. a DriveCentric 504) —
+  // the deal is already committed, and we still want to attempt the appointment.
+  let noteId: string | null = null;
+  let noteSkippedReason: string | undefined;
+  try {
+    const note = await createNote(customerId, {
+      description: buildNoteDescription(data.call),
+      url: callLogUrl(callId),
+      pinned: String(structured.lead_quality ?? "").toLowerCase() === "hot",
+    });
+    noteId = note.noteId;
+  } catch (err) {
+    noteSkippedReason = (err as Error).message;
+    console.error(
+      `[add-to-crm] note creation failed for customer ${customerId}, continuing: ${noteSkippedReason}`
+    );
+  }
 
   // Appointment, if the agent flagged one.
   let appointmentId: string | null = null;
@@ -493,7 +506,8 @@ async function syncCallToCrm(
   return {
     customerId,
     dealId,
-    noteId: note.noteId,
+    noteId,
+    noteSkippedReason,
     appointmentId,
     matchedStockId: stockId ?? null,
     newCustomer: !existingCustomerCrmId,
@@ -583,6 +597,7 @@ export async function POST(request: NextRequest) {
           customer_id: result.customerId,
           deal_id: result.dealId,
           note_id: result.noteId,
+          note_skipped_reason: result.noteSkippedReason ?? null,
           appointment_id: result.appointmentId,
           matched_stock_id: result.matchedStockId,
           new_customer: result.newCustomer,

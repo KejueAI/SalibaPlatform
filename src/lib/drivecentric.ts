@@ -74,6 +74,17 @@ interface DcFetchOptions {
   query?: Record<string, string | number | undefined | null>;
 }
 
+// Per-request timeout (ms). DriveCentric occasionally returns 504s when a
+// request hangs upstream; cap how long we wait so a stuck request fails fast
+// and can be retried rather than blocking the whole sync.
+const REQUEST_TIMEOUT_MS = Number(process.env.DRIVECENTRIC_TIMEOUT_MS) || 30_000;
+// Gateway-class statuses that are worth retrying — they're transient/upstream,
+// not a problem with our payload.
+const RETRYABLE_STATUS = new Set([502, 503, 504]);
+const MAX_RETRIES = Number(process.env.DRIVECENTRIC_MAX_RETRIES) || 2;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function dcFetch(
   path: string,
   opts: DcFetchOptions = {},
@@ -90,23 +101,81 @@ async function dcFetch(
     }
   }
 
-  const res = await fetch(url, {
-    method: opts.method ?? "GET",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-  });
+  const method = opts.method ?? "GET";
+  const bodyStr =
+    opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
+  // Only log the path + querystring (no host/token) for diagnostics.
+  const label = `${method} ${url.pathname}${url.search}`;
 
-  // If the cached token was rejected, drop it and retry once.
-  if (res.status === 401 && retryOn401) {
-    cachedToken = null;
-    return dcFetch(path, opts, false);
+  // Retry loop for transient gateway errors (502/503/504) and timeouts.
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const startedAt = Date.now();
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: bodyStr,
+        signal: controller.signal,
+      });
+      const ms = Date.now() - startedAt;
+      console.log(
+        `[drivecentric] http: ${label} -> ${res.status} in ${ms}ms` +
+          (bodyStr ? ` (req ${bodyStr.length}B)` : "") +
+          (attempt > 0 ? ` [attempt ${attempt + 1}/${MAX_RETRIES + 1}]` : "")
+      );
+
+      // If the cached token was rejected, drop it and retry once.
+      if (res.status === 401 && retryOn401) {
+        clearTimeout(timeout);
+        cachedToken = null;
+        return dcFetch(path, opts, false);
+      }
+
+      // Retry transient gateway errors with linear backoff.
+      if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
+        const backoff = 500 * (attempt + 1);
+        const errBody = await res.text().catch(() => "");
+        console.warn(
+          `[drivecentric] http: ${label} got ${res.status}, retrying in ${backoff}ms` +
+            (errBody ? ` — body: ${errBody.slice(0, 200)}` : "")
+        );
+        clearTimeout(timeout);
+        await sleep(backoff);
+        continue;
+      }
+
+      clearTimeout(timeout);
+      return res;
+    } catch (err) {
+      clearTimeout(timeout);
+      const ms = Date.now() - startedAt;
+      const aborted = (err as Error).name === "AbortError";
+      const reason = aborted
+        ? `timed out after ${REQUEST_TIMEOUT_MS}ms`
+        : (err as Error).message;
+      if (attempt < MAX_RETRIES) {
+        const backoff = 500 * (attempt + 1);
+        console.warn(
+          `[drivecentric] http: ${label} ${reason} (${ms}ms), retrying in ${backoff}ms`
+        );
+        await sleep(backoff);
+        continue;
+      }
+      console.error(
+        `[drivecentric] http: ${label} ${reason} (${ms}ms), giving up after ${MAX_RETRIES + 1} attempts`
+      );
+      throw err;
+    }
   }
 
-  return res;
+  // Unreachable: the loop either returns a Response or throws.
+  throw new Error(`DriveCentric request to ${label} exhausted retries`);
 }
 
 async function readErrorBody(res: Response): Promise<string> {
@@ -171,9 +240,10 @@ export async function createNote(
     { method: "POST", body: note }
   );
   if (!res.ok) {
-    console.error(`[drivecentric] create note: failed (${res.status})`);
+    const body = await readErrorBody(res);
+    console.error(`[drivecentric] create note: failed (${res.status}) — ${body}`);
     throw new Error(
-      `DriveCentric createNote failed (${res.status}): ${await readErrorBody(res)}`
+      `DriveCentric createNote failed (${res.status}): ${body}`
     );
   }
   const created = (await res.json()) as DcCreateNoteResponse;
