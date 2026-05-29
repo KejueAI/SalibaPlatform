@@ -183,6 +183,20 @@ async function readErrorBody(res: Response): Promise<string> {
   return text.slice(0, 400);
 }
 
+// ─── Store (diagnostics) ───────────────────────────────────────────────────────
+
+// Fetch the raw store record — used to inspect the store's configured timezone
+// and business hours when appointments are rejected as "outside business hours".
+export async function getStore(): Promise<unknown> {
+  const res = await dcFetch(`/api/stores/${STORE_ID}`);
+  if (!res.ok) {
+    throw new Error(
+      `DriveCentric getStore failed (${res.status}): ${await readErrorBody(res)}`
+    );
+  }
+  return res.json();
+}
+
 // ─── Customers ───────────────────────────────────────────────────────────────
 
 export interface DcCustomerSummary {

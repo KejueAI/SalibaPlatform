@@ -22,6 +22,7 @@ import {
   createAppointment,
   createNote,
   findIdentifier,
+  getStore,
   searchCustomers,
   upsertDeal,
   type DcAppointmentType,
@@ -691,6 +692,18 @@ async function syncCallToCrm(
       console.error(
         `[add-to-crm] appointment: creation failed for customer ${customerId}: ${appointmentSkippedReason}`
       );
+      // Diagnostic: dump the store's configured timezone + business hours so we
+      // can see why a normal slot is rejected as "outside business hours".
+      try {
+        const store = await getStore();
+        console.log(
+          `[add-to-crm] appointment: store config for diagnosis -> ${JSON.stringify(store)}`
+        );
+      } catch (storeErr) {
+        console.error(
+          `[add-to-crm] appointment: could not fetch store config: ${(storeErr as Error).message}`
+        );
+      }
     }
   } else {
     appointmentSkippedReason = planned.reason;
