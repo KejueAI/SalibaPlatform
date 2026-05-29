@@ -374,6 +374,54 @@ function normalizeAppointmentType(raw: string | undefined): DcAppointmentType {
   return "TestDrive";
 }
 
+// Business timezone for "today" — the model speaks dates in the caller's day,
+// so compute the current year there (UTC drift would burn us near midnight).
+const APPOINTMENT_TZ = process.env.DRIVECENTRIC_TZ || "Asia/Dubai";
+
+function currentYearInTz(tz: string): number {
+  return Number(
+    new Intl.DateTimeFormat("en-US", { timeZone: tz, year: "numeric" }).format(
+      new Date()
+    )
+  );
+}
+
+// Layer-3 defence against the model's training-data year bias (it confidently
+// emits e.g. 2024 when it's 2026). We never trust the year the model sent:
+// force it to the current year, and if that lands in the past, bump to next
+// year — preserving month/day/time. Month/day come from the UTC instant the
+// model provided; only the year is rewritten.
+function correctAppointmentYear(when: Date): {
+  fixed: Date;
+  corrected: boolean;
+} {
+  const buildForYear = (year: number) => {
+    const month = when.getUTCMonth();
+    const day = when.getUTCDate();
+    // Feb 29 on a non-leap year would roll over to Mar 1 via Date.UTC — clamp
+    // it to the 28th instead.
+    const isLeap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    const safeDay = month === 1 && day === 29 && !isLeap ? 28 : day;
+    return new Date(
+      Date.UTC(
+        year,
+        month,
+        safeDay,
+        when.getUTCHours(),
+        when.getUTCMinutes(),
+        when.getUTCSeconds()
+      )
+    );
+  };
+
+  const thisYear = currentYearInTz(APPOINTMENT_TZ);
+  let fixed = buildForYear(thisYear);
+  if (fixed.getTime() <= Date.now()) {
+    fixed = buildForYear(thisYear + 1);
+  }
+  return { fixed, corrected: fixed.getTime() !== when.getTime() };
+}
+
 function planAppointment(
   structured: Record<string, unknown>
 ): AppointmentPlan {
@@ -389,20 +437,21 @@ function planAppointment(
   if (Number.isNaN(when.getTime())) {
     return { ok: false, reason: `appointment_datetime is unparseable: ${raw}` };
   }
-  if (when.getTime() <= Date.now()) {
-    // API rejects past dates — surface the value so a wrong year (a common
-    // transcription error) is obvious in the logs.
-    return {
-      ok: false,
-      reason: `appointment_datetime ${when.toISOString()} is in the past — DriveCentric rejects past dates`,
-    };
+
+  // Don't reject a past date — the model's year is untrustworthy. Force it to
+  // the current year (or next year if that's still past) and log the fix.
+  const { fixed, corrected } = correctAppointmentYear(when);
+  if (corrected) {
+    console.warn(
+      `[add-to-crm] appointment: corrected year ${when.toISOString()} -> ${fixed.toISOString()} (model year bias)`
+    );
   }
 
   return {
     ok: true,
     appointment: {
       type: normalizeAppointmentType(str(structured.appointment_type)),
-      appointmentDate: when.toISOString(),
+      appointmentDate: fixed.toISOString(),
       notes: str(structured.appointment_notes),
     },
   };
