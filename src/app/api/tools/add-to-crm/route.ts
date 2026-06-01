@@ -136,14 +136,27 @@ function callLogUrl(callId: string): string {
 }
 
 // DriveCentric's Customer Phones validator only accepts 10 raw digits
-// (`xxxxxxxxxx`) — Kejue sends E.164 (`+15551234567`). Strip everything
-// non-numeric and keep the last 10 digits. Returns null if we can't form
-// a valid 10-digit number, in which case we omit the phone entirely
-// (better than failing the whole upsert).
-function normalizePhoneForDc(phone: string | undefined): string | null {
-  if (!phone) return null;
+// (`xxxxxxxxxx`) — Kejue often sends E.164 (`+15551234567`) or the agent may
+// extract a formatted phone_number. Strip everything non-numeric and keep the
+// last 10 digits. Returns null if we can't form a valid 10-digit number, in
+// which case we omit the phone entirely (better than failing the whole upsert).
+function last10Digits(phone: string): string | null {
   const last10 = phone.replace(/\D/g, "").slice(-10);
   return last10.length === 10 ? last10 : null;
+}
+
+function normalizePhoneForDc(phone: string | undefined): string | null {
+  return phone ? last10Digits(phone) : null;
+}
+
+function resolvePhoneForDc(
+  contact: KejueContact,
+  structured: Record<string, unknown>
+): string | null {
+  return (
+    normalizePhoneForDc(str(structured.phone_number)) ??
+    normalizePhoneForDc(contact.phone)
+  );
 }
 
 // Best-effort first/last name resolution that prefers, in order:
@@ -169,21 +182,35 @@ function resolveName(
 
 // ─── Customer lookup ─────────────────────────────────────────────────────────
 
+async function findCustomerIdByPhone(phone: string): Promise<string | null> {
+  let hits = await searchCustomers({ phone });
+  if (hits.length > 0) return hits[0].id;
+
+  const last10 = last10Digits(phone);
+  if (last10 && last10 !== phone) {
+    hits = await searchCustomers({ phone: last10 });
+    if (hits.length > 0) return hits[0].id;
+  }
+
+  return null;
+}
+
 async function findExistingCustomerId(
   contact: KejueContact,
   structured: Record<string, unknown>
 ): Promise<string | null> {
-  // 1) Phone (E.164 from Kejue), then last-10 as a fallback.
-  const phone = contact.phone;
-  if (phone) {
-    let hits = await searchCustomers({ phone });
-    if (hits.length > 0) return hits[0].id;
+  // 1) Phone: prefer the agent-extracted `phone_number`, then Kejue's
+  //    contact.phone. Search the raw value first, then last-10 as a fallback.
+  const extractedPhone = str(structured.phone_number);
+  if (extractedPhone) {
+    const id = await findCustomerIdByPhone(extractedPhone);
+    if (id) return id;
+  }
 
-    const last10 = phone.replace(/\D/g, "").slice(-10);
-    if (last10.length === 10 && last10 !== phone) {
-      hits = await searchCustomers({ phone: last10 });
-      if (hits.length > 0) return hits[0].id;
-    }
+  const contactPhone = str(contact.phone);
+  if (contactPhone && contactPhone !== extractedPhone) {
+    const id = await findCustomerIdByPhone(contactPhone);
+    if (id) return id;
   }
 
   // 2) Email.
@@ -246,9 +273,10 @@ function buildDealPayload(opts: {
     customerIdentifiers.unshift({ type: "CrmId", value: existingCustomerCrmId });
   }
 
-  // DriveCentric requires phones in 10-digit format (xxxxxxxxxx). Drop the
-  // phone if we can't normalize cleanly rather than failing the whole upsert.
-  const dcPhone = normalizePhoneForDc(contact.phone);
+  // DriveCentric requires phones in 10-digit format (xxxxxxxxxx). Prefer the
+  // agent-extracted phone_number, fall back to contact.phone, and drop the phone
+  // if neither can normalize cleanly rather than failing the whole upsert.
+  const dcPhone = resolvePhoneForDc(contact, structured);
   const phones: NonNullable<DcDealPayload["deal"]["customers"][number]["phones"]> =
     dcPhone ? [{ type: "Mobile", value: dcPhone }] : [];
   const emails: NonNullable<DcDealPayload["deal"]["customers"][number]["emails"]> =
