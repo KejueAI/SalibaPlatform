@@ -214,7 +214,7 @@ async function findExistingCustomerId(
   }
 
   // 2) Email.
-  const email = str(structured.customer_email) ?? contact.email;
+  const email = str(structured.customer_email) ?? str(contact.email);
   if (email) {
     const hits = await searchCustomers({ email });
     if (hits.length > 0) return hits[0].id;
@@ -259,7 +259,7 @@ function buildDealPayload(opts: {
   // Customer name — prefer agent-extracted fields, then Kejue's split contact
   // fields, then split contact.full_name / contact.name.
   const { firstName, lastName } = resolveName(contact, structured);
-  const email = str(structured.customer_email) ?? contact.email;
+  const email = str(structured.customer_email) ?? str(contact.email);
 
   const stageKey = String(structured.lead_quality ?? "").toLowerCase();
   const stage = LEAD_QUALITY_TO_STAGE[stageKey] ?? "Lead";
