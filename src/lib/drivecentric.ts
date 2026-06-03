@@ -197,6 +197,65 @@ export async function getStore(): Promise<unknown> {
   return res.json();
 }
 
+// ─── Store hours ───────────────────────────────────────────────────────────────
+
+// One day of store hours. `date` is the store-local calendar date; open/close
+// are UTC instants (null on days the store is closed).
+export interface DcStoreHoursDay {
+  storeId?: string | null;
+  date: string; // YYYY-MM-DD
+  openTimeUtc?: string | null;
+  closeTimeUtc?: string | null;
+  isHolidayHours: boolean;
+  modifiedAtUtc?: string | null;
+}
+
+interface DcStoreHoursResponse {
+  data?: DcStoreHoursDay[] | null;
+  meta?: { nextPageUrl?: string | null } | null;
+}
+
+// Fetch store hours for a date range, following pagination. The page cap is a
+// safety net — a month of daily rows should never span 10 pages.
+export async function getStoreHours(params: {
+  startDate?: string; // YYYY-MM-DD
+  endDate?: string; // YYYY-MM-DD
+}): Promise<DcStoreHoursDay[]> {
+  const all: DcStoreHoursDay[] = [];
+  let nextPageToken: string | undefined;
+
+  for (let page = 0; page < 10; page++) {
+    const res = await dcFetch(`/api/stores/${STORE_ID}/store-hours`, {
+      query: {
+        startDate: params.startDate,
+        endDate: params.endDate,
+        nextPageToken,
+      },
+    });
+    if (!res.ok) {
+      console.error(`[drivecentric] store hours: failed (${res.status})`);
+      throw new Error(
+        `DriveCentric getStoreHours failed (${res.status}): ${await readErrorBody(res)}`
+      );
+    }
+    const body = (await res.json()) as DcStoreHoursResponse;
+    all.push(...(body.data ?? []));
+
+    const nextUrl = body.meta?.nextPageUrl;
+    if (!nextUrl) break;
+    try {
+      nextPageToken =
+        new URL(nextUrl, BASE).searchParams.get("nextPageToken") ?? undefined;
+    } catch {
+      break;
+    }
+    if (!nextPageToken) break;
+  }
+
+  console.log(`[drivecentric] store hours: ${all.length} day(s)`);
+  return all;
+}
+
 // ─── Customers ───────────────────────────────────────────────────────────────
 
 export interface DcCustomerSummary {
