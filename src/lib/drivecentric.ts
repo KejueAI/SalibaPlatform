@@ -389,6 +389,34 @@ export interface DcIdentifier {
   value: string;
 }
 
+// Shared vehicle shape — DriveCentric's API uses one VehicleModel for both
+// vehicle interests and trade-ins. year/make/model are required; everything
+// else is optional/nullable.
+export interface DcVehicle {
+  identifiers: DcIdentifier[];
+  vin?: string | null;
+  stockNumber?: string | null;
+  year: number;
+  make: string;
+  model: string;
+  trim?: string | null;
+  mileage?: number | null;
+  exteriorColor?: string | null;
+  interiorColor?: string | null;
+}
+
+// Trade-in lienholder. The API also accepts an `address` (AddressModel) which
+// we don't populate yet — add it here if/when the agent extracts one.
+export interface DcLienholder {
+  name?: string | null;
+  contact?: string | null;
+  phone?: string | null;
+  goodUntil?: string | null;
+  account?: string | null;
+  perDiem?: number | null;
+  comments?: string | null;
+}
+
 export interface DcDealPayload {
   deal: {
     identifiers: DcIdentifier[];
@@ -415,34 +443,16 @@ export interface DcDealPayload {
     salesperson1?: { identifiers: DcIdentifier[] };
     salesperson2?: { identifiers: DcIdentifier[] };
     vehicleInterests?: Array<{
-      priority?: number;
+      priority?: number | null;
       stockType: "New" | "Used";
-      vehicle: {
-        identifiers: DcIdentifier[];
-        vin?: string | null;
-        stockNumber?: string | null;
-        year: number;
-        make: string;
-        model: string;
-        trim?: string | null;
-        mileage?: number | null;
-        exteriorColor?: string | null;
-        interiorColor?: string | null;
-      };
+      vehicle: DcVehicle;
     }> | null;
     tradeIns?: Array<{
-      vehicle: {
-        identifiers: DcIdentifier[];
-        vin?: string | null;
-        year: number;
-        make: string;
-        model: string;
-        trim?: string | null;
-        mileage?: number | null;
-      };
+      vehicle: DcVehicle;
       payoffAmount?: number | null;
       allowance?: number | null;
       actualCashValue?: number | null;
+      lienholder?: DcLienholder;
     }> | null;
     activities?: Array<{
       identifiers: DcIdentifier[];

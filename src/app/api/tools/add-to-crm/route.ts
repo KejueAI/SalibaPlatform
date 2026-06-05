@@ -231,6 +231,79 @@ async function findExistingCustomerId(
   return null;
 }
 
+// ─── Vehicle interest resolution ─────────────────────────────────────────────
+
+// A vehicle interest ready to drop into the deal payload. Resolved either from
+// our local inventory (matched by stock #) or from agent-extracted fields when
+// the caller's vehicle isn't in our `cars` table.
+interface ResolvedVehicleInterest {
+  stockType: "New" | "Used";
+  matchedStockId: string | null; // set only when a `cars` row was found
+  vehicle: {
+    vin: string | null;
+    stockNumber: string | null;
+    year: number;
+    make: string;
+    model: string;
+    trim: string | null;
+    mileage: number | null;
+    exteriorColor: string | null;
+    interiorColor: string | null;
+  };
+}
+
+// Normalize the agent's free-form new/used signal. Our `cars` table doesn't
+// track condition, so without an explicit signal we default to Used (the
+// dealership's primary inventory) — overridable later in the dashboard.
+function normalizeStockType(raw: string | undefined): "New" | "Used" {
+  const cleaned = (raw ?? "").replace(/[\s_-]/g, "").toLowerCase();
+  if (cleaned === "new") return "New";
+  return "Used"; // used / preowned / cpo / unspecified
+}
+
+// Resolve the caller's single vehicle of interest into a payload-ready vehicle.
+// When `interested_stock_id` matches our local inventory (cars table) that row
+// supplies year/make/model/etc.; otherwise we fall back to the agent's flat
+// `interested_*` fields so a vehicle that isn't in our lot still reaches the
+// CRM. Returns null when we can't form the API-required year/make/model rather
+// than failing the whole upsert.
+async function resolveVehicleInterest(
+  structured: Record<string, unknown>
+): Promise<ResolvedVehicleInterest | null> {
+  const stockId = str(structured.interested_stock_id)?.toUpperCase();
+  let car: Car | null = null;
+  if (stockId) {
+    car =
+      (await db.query.cars.findFirst({
+        where: eq(cars.stockId, stockId),
+      })) ?? null;
+  }
+
+  const year = car?.year ?? num(structured.interested_year);
+  const make = car?.make ?? str(structured.interested_make);
+  const model = car?.model ?? str(structured.interested_model);
+  // DriveCentric requires year/make/model — bail if we can't form a vehicle.
+  if (!year || !make || !model) return null;
+
+  return {
+    stockType: normalizeStockType(str(structured.interested_stock_type)),
+    matchedStockId: car ? car.stockId : null,
+    vehicle: {
+      vin: car?.vin ?? str(structured.interested_vin) ?? null,
+      // Keep the stock # even when it didn't match our table — DriveCentric's
+      // own inventory is a superset of our mirror, so it may still match there.
+      stockNumber: car?.stockId ?? stockId ?? null,
+      year,
+      make,
+      model,
+      trim: car?.trim ?? str(structured.interested_trim) ?? null,
+      mileage: car?.mileage ?? num(structured.interested_mileage) ?? null,
+      exteriorColor: car?.color ?? str(structured.interested_exterior_color) ?? null,
+      interiorColor: str(structured.interested_interior_color) ?? null,
+    },
+  };
+}
+
 // ─── Deal payload construction ───────────────────────────────────────────────
 
 function buildDealPayload(opts: {
@@ -238,7 +311,7 @@ function buildDealPayload(opts: {
   existingCustomerCrmId: string | null;
   contact: KejueContact;
   structured: Record<string, unknown>;
-  car: Car | null;
+  resolvedInterest: ResolvedVehicleInterest | null;
   callId: string;
   callSummary: string | undefined;
   callEndedAt: string;
@@ -249,7 +322,7 @@ function buildDealPayload(opts: {
     existingCustomerCrmId,
     contact,
     structured,
-    car,
+    resolvedInterest,
     callId,
     callSummary,
     callEndedAt,
@@ -282,24 +355,24 @@ function buildDealPayload(opts: {
   const emails: NonNullable<DcDealPayload["deal"]["customers"][number]["emails"]> =
     email ? [{ type: "Home", value: email }] : [];
 
-  // Vehicle interest from our local cars table (looked up by stock_id).
+  // Vehicle interest — resolved upstream from inventory and/or agent-extracted
+  // fields. Stable PartnerId so retries update rather than duplicate.
   const vehicleInterests: NonNullable<DcDealPayload["deal"]["vehicleInterests"]> = [];
-  if (car) {
+  if (resolvedInterest) {
     vehicleInterests.push({
       priority: 1,
-      // We don't track new/used in our schema; default to Used (the dealership's
-      // primary inventory). Override later via the dashboard if needed.
-      stockType: "Used",
+      stockType: resolvedInterest.stockType,
       vehicle: {
         identifiers: [{ type: "PartnerId", value: `vi_${partnerKey}` }],
-        vin: car.vin ?? null,
-        stockNumber: car.stockId,
-        year: car.year,
-        make: car.make,
-        model: car.model,
-        trim: car.trim ?? null,
-        mileage: car.mileage ?? null,
-        exteriorColor: car.color ?? null,
+        vin: resolvedInterest.vehicle.vin,
+        stockNumber: resolvedInterest.vehicle.stockNumber,
+        year: resolvedInterest.vehicle.year,
+        make: resolvedInterest.vehicle.make,
+        model: resolvedInterest.vehicle.model,
+        trim: resolvedInterest.vehicle.trim,
+        mileage: resolvedInterest.vehicle.mileage,
+        exteriorColor: resolvedInterest.vehicle.exteriorColor,
+        interiorColor: resolvedInterest.vehicle.interiorColor,
       },
     });
   }
@@ -310,6 +383,7 @@ function buildDealPayload(opts: {
   const tradeMake = str(structured.trade_make);
   const tradeModel = str(structured.trade_model);
   if (bool(structured.has_trade_in) && tradeYear && tradeMake && tradeModel) {
+    const lienholderName = str(structured.trade_lienholder);
     tradeIns.push({
       vehicle: {
         identifiers: [{ type: "PartnerId", value: `ti_${partnerKey}` }],
@@ -317,9 +391,14 @@ function buildDealPayload(opts: {
         year: tradeYear,
         make: tradeMake,
         model: tradeModel,
+        trim: str(structured.trade_trim) ?? null,
         mileage: num(structured.trade_mileage) ?? null,
+        exteriorColor: str(structured.trade_exterior_color) ?? null,
       },
       payoffAmount: num(structured.trade_payoff) ?? null,
+      // Caller-stated lienholder ("I still owe Chase"); other lienholder fields
+      // (account, payoff date, etc.) aren't something a voice caller provides.
+      lienholder: lienholderName ? { name: lienholderName } : undefined,
     });
   }
 
@@ -636,16 +715,11 @@ async function syncCallToCrm(
   const partnerKey = conversationId; // stable key so retries hit the same deal/customer
   const callEndedAt = data.conversation?.ended_at ?? payload.timestamp ?? new Date().toISOString();
 
-  // Look up the interested car in our inventory (by stock_id) so we can
-  // populate vehicle interest with year/make/model/vin without re-extracting.
-  const stockId = str(structured.interested_stock_id)?.toUpperCase();
-  let car: Car | null = null;
-  if (stockId) {
-    car =
-      (await db.query.cars.findFirst({
-        where: eq(cars.stockId, stockId),
-      })) ?? null;
-  }
+  // Resolve the caller's vehicle of interest — matched against our inventory by
+  // stock # where possible, otherwise built from the agent's extracted fields
+  // so a vehicle that isn't in our lot still reaches DriveCentric.
+  const resolvedInterest = await resolveVehicleInterest(structured);
+  const matchedStockId = resolvedInterest?.matchedStockId ?? null;
 
   const existingCustomerCrmId = await findExistingCustomerId(data.contact, structured);
 
@@ -654,7 +728,7 @@ async function syncCallToCrm(
     existingCustomerCrmId,
     contact: data.contact,
     structured,
-    car,
+    resolvedInterest,
     callId,
     callSummary: data.call.summary,
     callEndedAt,
@@ -749,7 +823,7 @@ async function syncCallToCrm(
     noteId,
     noteSkippedReason,
     appointmentId,
-    matchedStockId: stockId ?? null,
+    matchedStockId,
     newCustomer: !existingCustomerCrmId,
     appointmentSkippedReason,
   };
