@@ -86,13 +86,6 @@ const ALLOWED_APPOINTMENT_TYPES: ReadonlySet<DcAppointmentType> = new Set([
   "TestDrive",
 ]);
 
-const LEAD_QUALITY_TO_STAGE: Record<string, NonNullable<DcDealPayload["deal"]["stage"]>> = {
-  hot: "Engaged",
-  warm: "Engaged",
-  cold: "Lead",
-  not_interested: "Dead",
-};
-
 const NOTE_MAX_LEN = 1000; // per DriveCentric Notes API
 const ACTIVITY_CONTENT_MAX_LEN = 2000;
 const COMMENTS_MAX_LEN = 500;
@@ -334,8 +327,10 @@ function buildDealPayload(opts: {
   const { firstName, lastName } = resolveName(contact, structured);
   const email = str(structured.customer_email) ?? str(contact.email);
 
-  const stageKey = String(structured.lead_quality ?? "").toLowerCase();
-  const stage = LEAD_QUALITY_TO_STAGE[stageKey] ?? "Lead";
+  // All inbound callers enter the pipeline as a plain Lead — we don't auto-
+  // advance to Engaged off the agent's lead_quality read. (lead_quality still
+  // drives note pinning below.)
+  const stage = "Lead" as const;
 
   // Customer identifiers: include CrmId when known so DriveCentric updates
   // the existing record instead of creating a new one.
