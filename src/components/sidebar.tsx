@@ -9,6 +9,7 @@ import {
   Camera,
   FileSpreadsheet,
   Activity,
+  BarChart3,
   Users,
   LogOut,
   Menu,
@@ -19,6 +20,7 @@ import { Button } from "@/components/ui/button";
 
 const navigation = [
   { name: "Overview", href: "/dashboard", icon: LayoutDashboard },
+  { name: "Analytics", href: "/dashboard/analytics", icon: BarChart3 },
   { name: "Inventory", href: "/dashboard/inventory", icon: Car },
   { name: "Instagram", href: "/dashboard/sources/instagram", icon: Camera },
   { name: "vAuto", href: "/dashboard/sources/vauto", icon: FileSpreadsheet },
