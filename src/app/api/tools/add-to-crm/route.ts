@@ -86,6 +86,22 @@ const ALLOWED_APPOINTMENT_TYPES: ReadonlySet<DcAppointmentType> = new Set([
   "TestDrive",
 ]);
 
+// Caller-intent routing labels the agent extracts as `distro`. We pass the
+// matched value straight through as the deal's source description so the lead
+// lands at the right desk in DriveCentric.
+const ALLOWED_DISTRO: ReadonlySet<string> = new Set([
+  "KejueBuy", // buying or trading a vehicle
+  "KejueSell", // selling a vehicle
+  "KejueService", // service or parts
+  "KejueTitles", // registration, plates, or titles
+  "KejueAccounting", // accounting
+  "KejueVendor", // vendors or cold callers
+  "Kejue911", // issues, complaints, escalations
+  "KejueFinance", // banks calling
+]);
+
+const DEFAULT_SOURCE_DESCRIPTION = "Kejue voice agent";
+
 const NOTE_MAX_LEN = 1000; // per DriveCentric Notes API
 const ACTIVITY_CONTENT_MAX_LEN = 2000;
 const COMMENTS_MAX_LEN = 500;
@@ -297,6 +313,18 @@ async function resolveVehicleInterest(
   };
 }
 
+// Match the agent's `distro` value against the allowed routing labels
+// (case-insensitive, so a stray-cased value still routes). Returns undefined
+// when it's missing or unrecognized, so the caller can fall back to the default.
+function resolveDistro(structured: Record<string, unknown>): string | undefined {
+  const raw = str(structured.distro);
+  if (!raw) return undefined;
+  for (const value of ALLOWED_DISTRO) {
+    if (value.toLowerCase() === raw.toLowerCase()) return value;
+  }
+  return undefined;
+}
+
 // ─── Deal payload construction ───────────────────────────────────────────────
 
 function buildDealPayload(opts: {
@@ -411,7 +439,10 @@ function buildDealPayload(opts: {
 
   const deal: DcDealPayload["deal"] = {
     identifiers: [{ type: "PartnerId", value: `deal_${partnerKey}` }],
-    source: { type: "Phone", description: "Kejue voice agent" },
+    source: {
+      type: "Phone",
+      description: resolveDistro(structured) ?? DEFAULT_SOURCE_DESCRIPTION,
+    },
     stage,
     customers: [
       {
@@ -439,11 +470,15 @@ function buildDealPayload(opts: {
 
 // ─── Note + appointment building ─────────────────────────────────────────────
 
-function buildNoteDescription(call: KejueCallAnalyzedData["call"]): string {
+function buildNoteDescription(
+  call: KejueCallAnalyzedData["call"],
+  distro: string | undefined
+): string {
   const parts: string[] = [];
   if (call.summary) parts.push(call.summary);
 
   const meta: string[] = [];
+  if (distro) meta.push(`Routing: ${distro}`);
   if (call.outcome_id) meta.push(`Outcome: ${call.outcome_id}`);
   if (typeof call.score === "number") meta.push(`Score: ${call.score}`);
   if (typeof call.duration_seconds === "number") {
@@ -749,7 +784,7 @@ async function syncCallToCrm(
   let noteSkippedReason: string | undefined;
   try {
     const note = await createNote(customerId, {
-      description: buildNoteDescription(data.call),
+      description: buildNoteDescription(data.call, resolveDistro(structured)),
       url: callLogUrl(callId),
       pinned: String(structured.lead_quality ?? "").toLowerCase() === "hot",
     });
