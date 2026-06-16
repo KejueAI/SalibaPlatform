@@ -5,6 +5,15 @@
 // attaches a note containing the call summary + a link back to the Kejue log,
 // and optionally schedules an appointment if the agent extracted one.
 //
+// Existing-customer protection: when the caller already exists in DriveCentric
+// we never overwrite their identity fields (name / phone / email) or move the
+// deal's stage — agent-extracted values only fill a field that is *empty* in
+// the CRM. A human-entered name/phone/email always wins over what the agent
+// heard on the call. The note (and additive deal enrichments — vehicle
+// interest, trade-in, activity, appointment) are still attached. Brand-new
+// customers are created with the full extracted profile, since there is
+// nothing to clobber.
+//
 // Other event types (`call.started`, `call.ended`, campaign.*) are accepted
 // and acknowledged with 204 — we only act on `call.analyzed` so we have the
 // LLM-derived summary, outcome, and structured_data.
@@ -26,6 +35,7 @@ import {
   searchCustomers,
   upsertDeal,
   type DcAppointmentType,
+  type DcCustomerSummary,
   type DcDealPayload,
 } from "@/lib/drivecentric";
 
@@ -191,42 +201,47 @@ function resolveName(
 
 // ─── Customer lookup ─────────────────────────────────────────────────────────
 
-async function findCustomerIdByPhone(phone: string): Promise<string | null> {
+async function findCustomerByPhone(
+  phone: string
+): Promise<DcCustomerSummary | null> {
   let hits = await searchCustomers({ phone });
-  if (hits.length > 0) return hits[0].id;
+  if (hits.length > 0) return hits[0];
 
   const last10 = last10Digits(phone);
   if (last10 && last10 !== phone) {
     hits = await searchCustomers({ phone: last10 });
-    if (hits.length > 0) return hits[0].id;
+    if (hits.length > 0) return hits[0];
   }
 
   return null;
 }
 
-async function findExistingCustomerId(
+// Find the caller's existing DriveCentric record (if any), returning the full
+// customer summary — not just the id — so the deal builder can see which
+// identity fields are already populated and avoid overwriting them.
+async function findExistingCustomer(
   contact: KejueContact,
   structured: Record<string, unknown>
-): Promise<string | null> {
+): Promise<DcCustomerSummary | null> {
   // 1) Phone: prefer the agent-extracted `phone_number`, then Kejue's
   //    contact.phone. Search the raw value first, then last-10 as a fallback.
   const extractedPhone = str(structured.phone_number);
   if (extractedPhone) {
-    const id = await findCustomerIdByPhone(extractedPhone);
-    if (id) return id;
+    const hit = await findCustomerByPhone(extractedPhone);
+    if (hit) return hit;
   }
 
   const contactPhone = str(contact.phone);
   if (contactPhone && contactPhone !== extractedPhone) {
-    const id = await findCustomerIdByPhone(contactPhone);
-    if (id) return id;
+    const hit = await findCustomerByPhone(contactPhone);
+    if (hit) return hit;
   }
 
   // 2) Email.
   const email = str(structured.customer_email) ?? str(contact.email);
   if (email) {
     const hits = await searchCustomers({ email });
-    if (hits.length > 0) return hits[0].id;
+    if (hits.length > 0) return hits[0];
   }
 
   // 3) First + last name. Prefer Kejue's split fields, then fall back to
@@ -234,10 +249,18 @@ async function findExistingCustomerId(
   const { firstName, lastName } = resolveName(contact, structured);
   if (firstName !== "Unknown" && lastName !== "Unknown") {
     const hits = await searchCustomers({ firstName, lastName });
-    if (hits.length > 0) return hits[0].id;
+    if (hits.length > 0) return hits[0];
   }
 
   return null;
+}
+
+// True when the customer already has at least one non-empty value in a
+// phones/emails list — i.e. the field is populated and must not be overwritten.
+function hasContactValue(
+  entries: { value: string | null }[] | null | undefined
+): boolean {
+  return Boolean(entries?.some((e) => e.value && e.value.trim()));
 }
 
 // ─── Vehicle interest resolution ─────────────────────────────────────────────
@@ -329,7 +352,7 @@ function resolveDistro(structured: Record<string, unknown>): string | undefined 
 
 function buildDealPayload(opts: {
   partnerKey: string;
-  existingCustomerCrmId: string | null;
+  existingCustomer: DcCustomerSummary | null;
   contact: KejueContact;
   structured: Record<string, unknown>;
   resolvedInterest: ResolvedVehicleInterest | null;
@@ -340,7 +363,7 @@ function buildDealPayload(opts: {
 }): DcDealPayload {
   const {
     partnerKey,
-    existingCustomerCrmId,
+    existingCustomer,
     contact,
     structured,
     resolvedInterest,
@@ -350,29 +373,49 @@ function buildDealPayload(opts: {
     salespersonCrmId,
   } = opts;
 
-  // Customer name — prefer agent-extracted fields, then Kejue's split contact
-  // fields, then split contact.full_name / contact.name.
-  const { firstName, lastName } = resolveName(contact, structured);
-  const email = str(structured.customer_email) ?? str(contact.email);
+  // Agent's best read of the caller's identity — prefer agent-extracted fields,
+  // then Kejue's split contact fields, then split contact.full_name / .name.
+  const resolved = resolveName(contact, structured);
+  const extractedEmail = str(structured.customer_email) ?? str(contact.email);
+  // DriveCentric requires phones in 10-digit format (xxxxxxxxxx). Prefer the
+  // agent-extracted phone_number, fall back to contact.phone, and drop the
+  // phone if neither normalizes cleanly rather than failing the whole upsert.
+  const extractedPhone = resolvePhoneForDc(contact, structured);
 
-  // All inbound callers enter the pipeline as a plain Lead — we don't auto-
-  // advance to Engaged off the agent's lead_quality read. (lead_quality still
-  // drives note pinning below.)
-  const stage = "Lead" as const;
+  // Existing-customer protection. For a caller already in DriveCentric we must
+  // not overwrite human-entered identity fields: keep their stored name, and
+  // only contribute a phone/email when the CRM has none. (For a brand-new
+  // customer everything below falls through to the agent-extracted values.)
+  const existingFirst = str(existingCustomer?.firstName ?? undefined);
+  const existingLast = str(existingCustomer?.lastName ?? undefined);
+  const firstName = existingFirst ?? resolved.firstName;
+  const lastName = existingLast ?? resolved.lastName;
+
+  // Only fill phone/email when the CRM record has none — never replace an
+  // existing value. Omitting the field entirely (vs sending []) leaves the
+  // stored contact info untouched on the upsert.
+  const dcPhone = hasContactValue(existingCustomer?.phones)
+    ? undefined
+    : extractedPhone;
+  const email = hasContactValue(existingCustomer?.emails)
+    ? undefined
+    : extractedEmail;
+
+  // Stage / status: new callers enter the pipeline as a plain Lead. For an
+  // existing deal we omit stage entirely so we never knock a customer who's
+  // already Engaged/Sold/etc. back to Lead. (lead_quality still drives note
+  // pinning below regardless.)
+  const stage = existingCustomer ? undefined : ("Lead" as const);
 
   // Customer identifiers: include CrmId when known so DriveCentric updates
   // the existing record instead of creating a new one.
   const customerIdentifiers: DcDealPayload["deal"]["customers"][number]["identifiers"] = [
     { type: "PartnerId", value: `cust_${partnerKey}` },
   ];
-  if (existingCustomerCrmId) {
-    customerIdentifiers.unshift({ type: "CrmId", value: existingCustomerCrmId });
+  if (existingCustomer) {
+    customerIdentifiers.unshift({ type: "CrmId", value: existingCustomer.id });
   }
 
-  // DriveCentric requires phones in 10-digit format (xxxxxxxxxx). Prefer the
-  // agent-extracted phone_number, fall back to contact.phone, and drop the phone
-  // if neither can normalize cleanly rather than failing the whole upsert.
-  const dcPhone = resolvePhoneForDc(contact, structured);
   const phones: NonNullable<DcDealPayload["deal"]["customers"][number]["phones"]> =
     dcPhone ? [{ type: "Mobile", value: dcPhone }] : [];
   const emails: NonNullable<DcDealPayload["deal"]["customers"][number]["emails"]> =
@@ -751,11 +794,12 @@ async function syncCallToCrm(
   const resolvedInterest = await resolveVehicleInterest(structured);
   const matchedStockId = resolvedInterest?.matchedStockId ?? null;
 
-  const existingCustomerCrmId = await findExistingCustomerId(data.contact, structured);
+  const existingCustomer = await findExistingCustomer(data.contact, structured);
+  const existingCustomerCrmId = existingCustomer?.id ?? null;
 
   const dealPayload = buildDealPayload({
     partnerKey,
-    existingCustomerCrmId,
+    existingCustomer,
     contact: data.contact,
     structured,
     resolvedInterest,
