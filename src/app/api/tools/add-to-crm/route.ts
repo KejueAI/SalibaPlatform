@@ -110,7 +110,12 @@ const ALLOWED_DISTRO: ReadonlySet<string> = new Set([
   "KejueFinance", // banks calling
 ]);
 
-const DEFAULT_SOURCE_DESCRIPTION = "Kejue voice agent";
+// Fallback routing label when the agent didn't emit a usable `distro`. We
+// default to a *valid* distro (not a generic "Kejue voice agent" string) so an
+// unclassified inbound call still lands at a real desk in DriveCentric rather
+// than in an unrouted bucket. KejueBuy = the sales desk: this is a sales CRM, so
+// an unclassified caller is most defensibly treated as a sales lead.
+const DEFAULT_DISTRO = "KejueBuy";
 
 const NOTE_MAX_LEN = 1000; // per DriveCentric Notes API
 const ACTIVITY_CONTENT_MAX_LEN = 2000;
@@ -336,14 +341,26 @@ async function resolveVehicleInterest(
   };
 }
 
-// Match the agent's `distro` value against the allowed routing labels
-// (case-insensitive, so a stray-cased value still routes). Returns undefined
-// when it's missing or unrecognized, so the caller can fall back to the default.
+// Match the agent's `distro` value against the allowed routing labels.
+// The agent is instructed to return a bare label, but the LLM occasionally
+// wraps it — trailing punctuation ("KejueBuy."), quotes, or a short sentence
+// ("The distro is KejueBuy") — which a strict equality check would silently
+// reject and drop to the default. So we try exact match first (fast path,
+// case-insensitive), then fall back to a substring scan. The labels share no
+// full-label overlap (KejueBuy / KejueSell / KejueService …), so a substring
+// match can't cross-route. Returns undefined only when `distro` is missing or
+// genuinely contains none of the labels, so the caller can fall back.
 function resolveDistro(structured: Record<string, unknown>): string | undefined {
   const raw = str(structured.distro);
   if (!raw) return undefined;
+  // Normalize away separators the LLM sometimes inserts ("Kejue Buy",
+  // "kejue_buy", "kejue-buy") — the labels themselves contain none.
+  const norm = raw.toLowerCase().replace(/[\s_-]/g, "");
   for (const value of ALLOWED_DISTRO) {
-    if (value.toLowerCase() === raw.toLowerCase()) return value;
+    if (value.toLowerCase() === norm) return value;
+  }
+  for (const value of ALLOWED_DISTRO) {
+    if (norm.includes(value.toLowerCase())) return value;
   }
   return undefined;
 }
@@ -484,7 +501,7 @@ function buildDealPayload(opts: {
     identifiers: [{ type: "PartnerId", value: `deal_${partnerKey}` }],
     source: {
       type: "Phone",
-      description: resolveDistro(structured) ?? DEFAULT_SOURCE_DESCRIPTION,
+      description: resolveDistro(structured) ?? DEFAULT_DISTRO,
     },
     stage,
     customers: [
@@ -787,6 +804,17 @@ async function syncCallToCrm(
   const conversationId = data.conversation?.id ?? callId;
   const partnerKey = conversationId; // stable key so retries hit the same deal/customer
   const callEndedAt = data.conversation?.ended_at ?? payload.timestamp ?? new Date().toISOString();
+
+  // Distro visibility: when the agent sent a `distro` we couldn't resolve to a
+  // known routing label, log it so these show up in the server logs (and are
+  // distinguishable from calls that legitimately had no intent to route). The
+  // source description still falls back to DEFAULT_DISTRO downstream.
+  const rawDistro = str(structured.distro);
+  if (rawDistro && !resolveDistro(structured)) {
+    console.warn(
+      `[add-to-crm] distro: unrecognized value "${rawDistro}" for call ${callId} — defaulting source to ${DEFAULT_DISTRO}`
+    );
+  }
 
   // Resolve the caller's vehicle of interest — matched against our inventory by
   // stock # where possible, otherwise built from the agent's extracted fields
