@@ -44,3 +44,5 @@ next-env.d.ts
 
 .claude
 CLAUDE.md
+docs/broken_crm_records.csv
+docs/misattached_crm_leads.csv

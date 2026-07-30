@@ -162,25 +162,44 @@ function callLogUrl(callId: string): string {
 // DriveCentric's Customer Phones validator only accepts 10 raw digits
 // (`xxxxxxxxxx`) — Kejue often sends E.164 (`+15551234567`) or the agent may
 // extract a formatted phone_number. Strip everything non-numeric and keep the
-// last 10 digits. Returns null if we can't form a valid 10-digit number, in
-// which case we omit the phone entirely (better than failing the whole upsert).
+// last 10 digits. Returns null if we can't form a valid 10-digit number.
+// Used for customer *search* only — for the value we send, see toNanpPhone.
 function last10Digits(phone: string): string | null {
   const last10 = phone.replace(/\D/g, "").slice(-10);
   return last10.length === 10 ? last10 : null;
 }
 
-function normalizePhoneForDc(phone: string | undefined): string | null {
-  return phone ? last10Digits(phone) : null;
+// Normalize to a *valid* NANP 10-digit number, or null. DriveCentric accepts
+// the upsert but silently drops phones its validator rejects (the customer
+// ends up with no phone at all), so only send numbers that can survive:
+// exactly 10 digits after stripping an optional leading US "1", with area
+// code and exchange not starting in 0/1. An international caller (e.g.
+// +447361786694) yields null — the raw number goes in the note instead.
+function toNanpPhone(phone: string | undefined): string | null {
+  if (!phone) return null;
+  const digits = phone.replace(/\D/g, "");
+  const ten =
+    digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+  if (ten.length !== 10) return null;
+  if ("01".includes(ten[0]) || "01".includes(ten[3])) return null;
+  return ten;
 }
 
 function resolvePhoneForDc(
   contact: KejueContact,
   structured: Record<string, unknown>
 ): string | null {
-  return (
-    normalizePhoneForDc(str(structured.phone_number)) ??
-    normalizePhoneForDc(contact.phone)
-  );
+  return toNanpPhone(str(structured.phone_number)) ?? toNanpPhone(contact.phone);
+}
+
+// The caller's number as we best know it, unnormalized — for the note text.
+// Prefer Kejue's contact.phone (true caller ID, E.164) over the agent's
+// transcription of a number read out loud.
+function rawCallbackPhone(
+  contact: KejueContact,
+  structured: Record<string, unknown>
+): string | undefined {
+  return str(contact.phone) ?? str(structured.phone_number);
 }
 
 // Best-effort first/last name resolution that prefers, in order:
@@ -251,10 +270,27 @@ async function findExistingCustomer(
 
   // 3) First + last name. Prefer Kejue's split fields, then fall back to
   //    splitting contact.full_name / contact.name.
+  //
+  // A name alone is a weak identity key — distinct customers share names
+  // (this store has two different "Miles Jones" records). Since the phone
+  // searches above already came up empty, a name hit that has a phone on
+  // file belongs to someone whose number is NOT the caller's — attaching to
+  // it writes this call onto the wrong person's record, and the caller's own
+  // number is then discarded by existing-customer protection. Only accept a
+  // name hit with no phone on file; otherwise create a fresh customer. A
+  // duplicate is recoverable in the CRM — a cross-contaminated record is not.
   const { firstName, lastName } = resolveName(contact, structured);
   if (firstName !== "Unknown" && lastName !== "Unknown") {
     const hits = await searchCustomers({ firstName, lastName });
-    if (hits.length > 0) return hits[0];
+    const safeHit = hits.find((h) => !hasContactValue(h.phones));
+    if (safeHit) return safeHit;
+    if (hits.length > 0) {
+      console.warn(
+        `[add-to-crm] name match rejected: ${hits.length} customer(s) named ` +
+          `"${firstName} ${lastName}" exist but all have a different phone on ` +
+          `file — creating a new customer instead of merging`
+      );
+    }
   }
 
   return null;
@@ -398,6 +434,7 @@ function buildDealPayload(opts: {
   // agent-extracted phone_number, fall back to contact.phone, and drop the
   // phone if neither normalizes cleanly rather than failing the whole upsert.
   const extractedPhone = resolvePhoneForDc(contact, structured);
+  const callbackForNote = rawCallbackPhone(contact, structured);
 
   // Existing-customer protection. For a caller already in DriveCentric we must
   // not overwrite human-entered identity fields: keep their stored name, and
@@ -405,8 +442,20 @@ function buildDealPayload(opts: {
   // customer everything below falls through to the agent-extracted values.)
   const existingFirst = str(existingCustomer?.firstName ?? undefined);
   const existingLast = str(existingCustomer?.lastName ?? undefined);
-  const firstName = existingFirst ?? resolved.firstName;
-  const lastName = existingLast ?? resolved.lastName;
+  let firstName = existingFirst ?? resolved.firstName;
+  let lastName = existingLast ?? resolved.lastName;
+
+  // A brand-new caller with no name at all would become one more identical
+  // "Unknown Unknown" record — indistinguishable in DriveCentric lists and
+  // unsearchable. Tag the last name with the callback number's last 4 digits
+  // so each record is findable and tells the team which caller it is.
+  if (!existingCustomer && firstName === "Unknown" && lastName === "Unknown") {
+    const digits = (rawCallbackPhone(contact, structured) ?? "").replace(/\D/g, "");
+    if (digits.length >= 4) {
+      firstName = "Unknown";
+      lastName = `Caller ${digits.slice(-4)}`;
+    }
+  }
 
   // Only fill phone/email when the CRM record has none — never replace an
   // existing value. Omitting the field entirely (vs sending []) leaves the
@@ -518,7 +567,19 @@ function buildDealPayload(opts: {
     vehicleInterests: vehicleInterests.length > 0 ? vehicleInterests : null,
     tradeIns: tradeIns.length > 0 ? tradeIns : null,
     activities: activities.length > 0 ? activities : null,
-    comments: truncate(callSummary, COMMENTS_MAX_LEN) ?? null,
+    // When the caller's number can't be stored in the phones field at all
+    // (international caller — no valid NANP form), lead the comments with the
+    // raw callback number so the team can still reach them from the deal.
+    comments:
+      truncate(
+        [
+          extractedPhone === null ? callbackForNote && `Callback: ${callbackForNote}` : undefined,
+          callSummary,
+        ]
+          .filter(Boolean)
+          .join(" — "),
+        COMMENTS_MAX_LEN
+      ) || null,
   };
 
   if (salespersonCrmId) {
@@ -532,13 +593,23 @@ function buildDealPayload(opts: {
 
 function buildNoteDescription(
   call: KejueCallAnalyzedData["call"],
-  distro: string | undefined
+  distro: string | undefined,
+  callbackPhone: string | undefined,
+  vehicleHint: string | undefined
 ): string {
   const parts: string[] = [];
   if (call.summary) parts.push(call.summary);
 
   const meta: string[] = [];
+  // Always carry the raw caller number in the note: DriveCentric silently
+  // drops phones its validator rejects (e.g. international numbers), and the
+  // note is then the only place the callback number survives.
+  if (callbackPhone) meta.push(`Callback: ${callbackPhone}`);
   if (distro) meta.push(`Routing: ${distro}`);
+  // Vehicle fragment the agent heard but we couldn't resolve into a deal
+  // vehicle-interest (e.g. just "GT3 RS" in interested_stock_id) — surface it
+  // rather than dropping it.
+  if (vehicleHint) meta.push(`Interested in: ${vehicleHint}`);
   if (call.outcome_id) meta.push(`Outcome: ${call.outcome_id}`);
   if (typeof call.score === "number") meta.push(`Score: ${call.score}`);
   if (typeof call.duration_seconds === "number") {
@@ -855,8 +926,26 @@ async function syncCallToCrm(
   let noteId: string | null = null;
   let noteSkippedReason: string | undefined;
   try {
+    // Vehicle info that resolveVehicleInterest couldn't turn into a deal
+    // vehicle (missing year/make/model) still matters to the sales team.
+    const vehicleHint = resolvedInterest
+      ? undefined
+      : [
+          str(structured.interested_year),
+          str(structured.interested_make),
+          str(structured.interested_model),
+          str(structured.interested_stock_id),
+        ]
+          .filter(Boolean)
+          .join(" ") || undefined;
+
     const note = await createNote(customerId, {
-      description: buildNoteDescription(data.call, resolveDistro(structured)),
+      description: buildNoteDescription(
+        data.call,
+        resolveDistro(structured),
+        rawCallbackPhone(data.contact, structured),
+        vehicleHint
+      ),
       url: callLogUrl(callId),
       pinned: String(structured.lead_quality ?? "").toLowerCase() === "hot",
     });
