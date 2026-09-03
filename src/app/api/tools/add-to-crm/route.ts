@@ -117,6 +117,20 @@ const ALLOWED_DISTRO: ReadonlySet<string> = new Set([
 // an unclassified caller is most defensibly treated as a sales lead.
 const DEFAULT_DISTRO = "KejueBuy";
 
+// DriveCentric routes leads to desks off the structured `source.type`, not the
+// free-text description. J&S wants buyers and sellers on distinct sources
+// (per David Stein, 2026-08-27): buyers → Internet, sellers → Campaign. Map our
+// buy/sell distro onto those types; every other intent (service, titles,
+// accounting, etc.) stays Phone since these are all inbound phone calls and
+// David only specified routing for buyers/sellers.
+function sourceTypeForDistro(
+  distro: string
+): "Internet" | "Campaign" | "Phone" {
+  if (distro === "KejueBuy") return "Internet";
+  if (distro === "KejueSell") return "Campaign";
+  return "Phone";
+}
+
 const NOTE_MAX_LEN = 1000; // per DriveCentric Notes API
 const ACTIVITY_CONTENT_MAX_LEN = 2000;
 const COMMENTS_MAX_LEN = 500;
@@ -426,6 +440,11 @@ function buildDealPayload(opts: {
     salespersonCrmId,
   } = opts;
 
+  // Routing label the agent classified the call as (buy/sell/service/…),
+  // falling back to the sales desk when unresolved. Drives both the deal's
+  // source type (buyers→Internet, sellers→Campaign) and its description.
+  const distro = resolveDistro(structured) ?? DEFAULT_DISTRO;
+
   // Agent's best read of the caller's identity — prefer agent-extracted fields,
   // then Kejue's split contact fields, then split contact.full_name / .name.
   const resolved = resolveName(contact, structured);
@@ -549,8 +568,8 @@ function buildDealPayload(opts: {
   const deal: DcDealPayload["deal"] = {
     identifiers: [{ type: "PartnerId", value: `deal_${partnerKey}` }],
     source: {
-      type: "Phone",
-      description: resolveDistro(structured) ?? DEFAULT_DISTRO,
+      type: sourceTypeForDistro(distro),
+      description: distro,
     },
     stage,
     customers: [
