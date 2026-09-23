@@ -4,6 +4,7 @@ import { cars } from "@/db/schema";
 import { eq, and, ilike, gte, lte, desc, sql, asc } from "drizzle-orm";
 import { auth } from "@/lib/auth";
 import { headers } from "next/headers";
+import { buildCarTsQuery } from "@/lib/car-search";
 
 async function getSession() {
   const session = await auth.api.getSession({ headers: await headers() });
@@ -38,17 +39,9 @@ export async function GET(request: NextRequest) {
   let results;
   let total;
 
-  if (search && search.trim()) {
-    const sanitized = search
-      .replace(/[&|!<>():*\\'"]/g, " ")
-      .trim();
+  const tsQuery = search ? buildCarTsQuery(search) : null;
 
-    const tsQuery = sanitized
-      .split(/\s+/)
-      .filter((w) => w.length > 0)
-      .map((w) => w + ":*")
-      .join(" & ");
-
+  if (tsQuery) {
     const whereClause = and(
       sql`search_vector @@ to_tsquery('english', ${tsQuery})`,
       ...conditions

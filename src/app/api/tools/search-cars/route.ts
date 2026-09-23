@@ -4,6 +4,7 @@ import { db } from "@/db";
 import { cars } from "@/db/schema";
 import { sql, and, eq, gte, lte, ilike } from "drizzle-orm";
 import type { VideoObject } from "@/db/schema";
+import { buildCarTsQuery } from "@/lib/car-search";
 
 // ─── Request schema ──────────────────────────────────────────────────────────
 //
@@ -155,18 +156,11 @@ export async function POST(request: NextRequest) {
 
   let results;
   if (query && query.trim()) {
-    // FTS query — strip Postgres tsquery operators to prevent injection
-    const sanitized = query.replace(/[&|!<>():*\\'"]/g, " ").trim();
+    const tsQuery = buildCarTsQuery(query);
 
-    if (!sanitized) {
+    if (!tsQuery) {
       return NextResponse.json({ results: [], total_count: 0 });
     }
-
-    const tsQuery = sanitized
-      .split(/\s+/)
-      .filter((w) => w.length > 0)
-      .map((w) => w + ":*")
-      .join(" & ");
 
     results = await db
       .select({
