@@ -1088,17 +1088,11 @@ function normalizeSonusPayload(sonus: SonusWebhookEnvelope): KejueWebhookEnvelop
     if (ex.status === "done" && ex.result) Object.assign(structured, ex.result);
   }
 
-  // Unlike Kejue (which tagged store wall-clock times as UTC — see
-  // planAppointment), Sonus's extraction emits a true instant, e.g.
-  // "2026-10-26T19:00:00Z" for 3pm Eastern. planAppointment reads only the
-  // literal clock digits, so re-express the instant as store-local first.
-  const apptRaw = str(structured.appointment_datetime);
-  if (apptRaw && /(Z|[+-]\d{2}:?\d{2})$/i.test(apptRaw)) {
-    const instant = new Date(apptRaw);
-    if (!Number.isNaN(instant.getTime())) {
-      structured.appointment_datetime = toZonedIso(instant, APPOINTMENT_TZ);
-    }
-  }
+  // appointment_datetime is passed through untouched: the Lead extraction
+  // asks for store-local wall-clock time with no zone suffix, and
+  // planAppointment reads only the clock digits — the same contract as Kejue.
+  // (Don't convert a trailing Z/offset: the extraction model has emitted both
+  // true UTC and wall-clock-tagged-UTC for the same request.)
 
   const data: KejueCallAnalyzedData = {
     call: {
