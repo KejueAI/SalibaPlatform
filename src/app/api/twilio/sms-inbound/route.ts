@@ -1,19 +1,23 @@
 // POST /api/twilio/sms-inbound
 //
 // Twilio inbound-SMS webhook. When a customer texts the dealership's Twilio
-// number while a Kejue voice call is in progress, we forward the SMS body
+// number while a voice call is in progress, we forward the SMS body
 // into the live call as injected context — the agent receives it as a
 // "data message" and can react to it naturally without breaking the call.
 //
 // Flow:
 //   1. Verify X-Twilio-Signature against TWILIO_AUTH_TOKEN.
-//   2. Resolve From → Kejue contact via /contacts?search=<phone>.
-//   3. Find that contact's active call via /calls?contact_id=&status=in_progress.
-//   4. POST /calls/{call_id}/inject-context with the SMS body.
-//   5. Always 200 with empty TwiML — we never auto-reply.
+//   2. Sonus (when SONUS_API_KEY is set): find the live call by exact caller
+//      number via /calls?caller_number=&status=live, then POST
+//      /calls/{id}/context with the SMS body.
+//   3. Otherwise / no live Sonus call — Kejue: resolve From → contact via
+//      /contacts?search=<phone>, find that contact's active call via
+//      /calls?contact_id=&status=in_progress, POST /calls/{id}/inject-context.
+//      (Kejue stays as the fallback until the number is moved to Sonus.)
+//   4. Always 200 with empty TwiML — we never auto-reply.
 //
 // Edge cases (all answered with empty TwiML 200 so Twilio doesn't retry):
-//   - No matching contact: log and drop.
+//   - No live call on either platform / no matching Kejue contact: log and drop.
 //   - No active call: log and drop.
 //   - Inject returns 409 (call ended between the lookup and the post): log and drop.
 
@@ -24,6 +28,7 @@ import {
   findContactByPhone,
   injectContextIntoCall,
 } from "@/lib/kejue";
+import * as sonus from "@/lib/sonus";
 
 export const runtime = "nodejs";
 
@@ -48,7 +53,8 @@ export async function POST(request: NextRequest): Promise<Response> {
   const params: Record<string, string> = {};
   for (const [k, v] of new URLSearchParams(rawBody)) params[k] = v;
 
-  // Reconstruct the public URL Twilio used. Trust X-Forwarded-* set by Railway.
+  // Reconstruct the public URL Twilio used. Trust X-Forwarded-* set by the
+  // reverse proxy (Traefik under Dokploy).
   const proto = request.headers.get("x-forwarded-proto") ?? "https";
   const host =
     request.headers.get("x-forwarded-host") ??
@@ -75,6 +81,39 @@ export async function POST(request: NextRequest): Promise<Response> {
     return twimlResponse();
   }
 
+  const mediaNote = numMedia > 0 ? ` (and sent ${numMedia} attachment${numMedia === 1 ? "" : "s"})` : "";
+  const injectText = `The customer just texted you${mediaNote}: "${body}"`;
+
+  if (sonus.isSonusConfigured()) {
+    try {
+      const call = await sonus.findLiveCallByCaller(from);
+      if (call) {
+        const result = await sonus.injectContextIntoCall(
+          call.id,
+          injectText,
+          `sms-${messageSid ?? crypto.randomUUID()}`,
+          "soon",
+        );
+        if (!result.ok) {
+          console.warn("[twilio/sms-inbound] Sonus context inject failed", {
+            callId: call.id,
+            status: result.status,
+            body: result.body,
+            messageSid,
+          });
+        } else {
+          console.info("[twilio/sms-inbound] injected SMS into Sonus call", {
+            callId: call.id,
+            messageSid,
+          });
+        }
+        return twimlResponse();
+      }
+    } catch (err) {
+      console.error("[twilio/sms-inbound] Sonus lookup/inject error", err);
+    }
+  }
+
   try {
     const contact = await findContactByPhone(from);
     if (!contact) {
@@ -94,9 +133,6 @@ export async function POST(request: NextRequest): Promise<Response> {
       });
       return twimlResponse();
     }
-
-    const mediaNote = numMedia > 0 ? ` (and sent ${numMedia} attachment${numMedia === 1 ? "" : "s"})` : "";
-    const injectText = `The customer just texted you${mediaNote}: "${body}"`;
 
     const result = await injectContextIntoCall(call.id, injectText, "soon");
     if (!result.ok) {

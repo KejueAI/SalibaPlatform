@@ -1,8 +1,9 @@
 // POST /api/tools/add-to-crm
 //
-// Webhook receiver for the Kejue voice agent. On `call.analyzed`, syncs the
+// Webhook receiver for the voice agent — Kejue (`call.analyzed`) and Sonus
+// (`call.completed`) both post here during the platform migration. Syncs the
 // caller into DriveCentric: finds-or-creates the customer (via deal upsert),
-// attaches a note containing the call summary + a link back to the Kejue log,
+// attaches a note containing the call summary + a link back to the call log,
 // and optionally schedules an appointment if the agent extracted one.
 //
 // Existing-customer protection: when the caller already exists in DriveCentric
@@ -19,14 +20,18 @@
 // LLM-derived summary, outcome, and structured_data.
 //
 // Auth: HMAC-SHA256 signature in `X-Kejue-Signature` over
-// `${X-Kejue-Timestamp}.${rawBody}` using KEJUE_WEBHOOK_SECRET.
+// `${X-Kejue-Timestamp}.${rawBody}` using KEJUE_WEBHOOK_SECRET, or in
+// `X-Sonus-Signature` over `${X-Sonus-Timestamp}.${rawBody}` using
+// SONUS_WEBHOOK_SECRET. A Sonus `call.completed` is normalized into the Kejue
+// `call.analyzed` envelope (see normalizeSonusPayload), so everything past the
+// route handler is platform-agnostic.
 
 import { NextRequest, NextResponse } from "next/server";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { cars, events } from "@/db/schema";
 import type { Car } from "@/db/schema";
-import { verifyKejueWebhook } from "@/lib/webhook-verify";
+import { verifyKejueWebhook, verifySonusWebhook } from "@/lib/webhook-verify";
 import {
   createAppointment,
   createNote,
@@ -68,6 +73,8 @@ interface KejueCallAnalyzedData {
     duration_seconds?: number;
     structured_data?: Record<string, unknown>;
     extracted_data?: Record<string, unknown>;
+    // Set by normalizeSonusPayload; Kejue calls fall back to callLogUrl().
+    log_url?: string;
   };
   contact: KejueContact;
   conversation?: {
@@ -84,6 +91,29 @@ interface KejueWebhookEnvelope {
   timestamp: string;
   data: unknown;
   metadata?: Record<string, unknown>;
+}
+
+// Sonus `call.completed` delivery (WebhookCallPayload, api_version 2026-07-01).
+// Only the fields we read are typed.
+interface SonusWebhookEnvelope {
+  event: string;
+  delivery_id: string;
+  delivered_at?: string;
+  test?: boolean;
+  call: {
+    id: string;
+    started_at?: string | null;
+    ended_at?: string | null;
+    duration_sec?: number | null;
+    outcome?: string | null;
+    caller_number?: string | null;
+    summary?: { status?: string; text?: string | null } | null;
+    extractions?: Array<{
+      name?: string;
+      status?: string;
+      result?: Record<string, unknown> | null;
+    }> | null;
+  } | null;
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -965,7 +995,7 @@ async function syncCallToCrm(
         rawCallbackPhone(data.contact, structured),
         vehicleHint
       ),
-      url: callLogUrl(callId),
+      url: data.call.log_url ?? callLogUrl(callId),
       pinned: String(structured.lead_quality ?? "").toLowerCase() === "hot",
     });
     noteId = note.noteId;
@@ -1039,21 +1069,76 @@ async function syncCallToCrm(
   };
 }
 
+// ─── Sonus → Kejue envelope ──────────────────────────────────────────────────
+
+// Maps a Sonus `call.completed` onto the Kejue `call.analyzed` shape that
+// syncCallToCrm consumes:
+//   - structured_data ← merged `result` of every finished extraction (the
+//     "Lead" extraction carries the same keys as Kejue's structured_data)
+//   - contact.phone   ← call.caller_number (true caller ID, E.164); Sonus has
+//     no contact name, so names come from the extraction as before
+//   - score           ← the extracted `call_score` (Kejue scored natively)
+//   - event_id        ← delivery_id, which is stable across Sonus retries
+function normalizeSonusPayload(sonus: SonusWebhookEnvelope): KejueWebhookEnvelope {
+  const call = sonus.call;
+  if (!call?.id) throw new Error("Missing call.id in Sonus payload");
+
+  const structured: Record<string, unknown> = {};
+  for (const ex of call.extractions ?? []) {
+    if (ex.status === "done" && ex.result) Object.assign(structured, ex.result);
+  }
+
+  const data: KejueCallAnalyzedData = {
+    call: {
+      id: call.id,
+      summary:
+        call.summary?.status === "done" ? call.summary.text ?? undefined : undefined,
+      outcome_id: call.outcome ?? undefined,
+      score: num(structured.call_score),
+      duration_seconds:
+        typeof call.duration_sec === "number" ? Math.round(call.duration_sec) : undefined,
+      structured_data: structured,
+      log_url: `https://app.sonus.ws/calls/${encodeURIComponent(call.id)}`,
+    },
+    contact: { id: call.id, phone: call.caller_number ?? undefined },
+    conversation: {
+      id: call.id,
+      started_at: call.started_at ?? undefined,
+      ended_at: call.ended_at ?? undefined,
+    },
+  };
+
+  return {
+    event: sonus.event === "call.completed" ? "call.analyzed" : sonus.event,
+    event_id: sonus.delivery_id,
+    timestamp: call.ended_at ?? sonus.delivered_at ?? new Date().toISOString(),
+    data,
+    metadata: { source: "sonus" },
+  };
+}
+
 // ─── Route handler ───────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
   // 1) Read raw body BEFORE parsing so HMAC matches byte-for-byte.
   const rawBody = await request.text();
 
-  // 2) Verify signature + timestamp freshness.
-  const signature = request.headers.get("x-kejue-signature");
-  const timestamp = request.headers.get("x-kejue-timestamp");
-  const verification = verifyKejueWebhook(
-    rawBody,
-    signature,
-    timestamp,
-    process.env.KEJUE_WEBHOOK_SECRET
-  );
+  // 2) Verify signature + timestamp freshness. The signature header says which
+  //    platform sent it.
+  const isSonus = request.headers.has("x-sonus-signature");
+  const verification = isSonus
+    ? verifySonusWebhook(
+        rawBody,
+        request.headers.get("x-sonus-signature"),
+        request.headers.get("x-sonus-timestamp"),
+        process.env.SONUS_WEBHOOK_SECRET
+      )
+    : verifyKejueWebhook(
+        rawBody,
+        request.headers.get("x-kejue-signature"),
+        request.headers.get("x-kejue-timestamp"),
+        process.env.KEJUE_WEBHOOK_SECRET
+      );
   if (!verification.ok) {
     // 401 is a permanent failure — Kejue won't retry, which is what we want
     // for bad signatures. Stale timestamps also shouldn't be retried.
@@ -1066,9 +1151,24 @@ export async function POST(request: NextRequest) {
   // 3) Parse envelope.
   let payload: KejueWebhookEnvelope;
   try {
-    payload = JSON.parse(rawBody) as KejueWebhookEnvelope;
+    const parsed = JSON.parse(rawBody);
+    if (isSonus) {
+      const sonus = parsed as SonusWebhookEnvelope;
+      // The dashboard's "send test event" carries sample data — never let it
+      // reach DriveCentric. Acknowledge so the test shows as delivered.
+      if (sonus.test) {
+        console.info(`[add-to-crm] Sonus test delivery ${sonus.delivery_id} acknowledged`);
+        return NextResponse.json({ ok: true, test: true });
+      }
+      if (sonus.event !== "call.completed") {
+        return new NextResponse(null, { status: 204 });
+      }
+      payload = normalizeSonusPayload(sonus);
+    } else {
+      payload = parsed as KejueWebhookEnvelope;
+    }
   } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid payload" }, { status: 400 });
   }
   if (!payload?.event || !payload?.event_id) {
     return NextResponse.json(
@@ -1083,8 +1183,11 @@ export async function POST(request: NextRequest) {
   }
 
   // 5) Idempotency: short-circuit duplicates without re-hitting DriveCentric.
+  //    A *failed* earlier attempt is not a duplicate — the platform's retry is
+  //    exactly how a transient DriveCentric outage recovers (the deal upsert is
+  //    keyed on the call, so re-running it is safe).
   const already = await findProcessedEvent(payload.event_id);
-  if (already) {
+  if (already && already.status !== "failed") {
     return NextResponse.json({
       duplicate: true,
       event_id: payload.event_id,
@@ -1100,6 +1203,7 @@ export async function POST(request: NextRequest) {
       status: "running",
       summary: {
         event_id: payload.event_id,
+        platform: isSonus ? "sonus" : "kejue",
         conversation_id:
           (payload.data as KejueCallAnalyzedData | undefined)?.conversation?.id ??
           null,
@@ -1118,6 +1222,7 @@ export async function POST(request: NextRequest) {
         status: "completed",
         summary: {
           event_id: payload.event_id,
+          platform: isSonus ? "sonus" : "kejue",
           customer_id: result.customerId,
           deal_id: result.dealId,
           note_id: result.noteId,
@@ -1143,7 +1248,7 @@ export async function POST(request: NextRequest) {
       })
       .where(eq(events.id, eventRow.id));
 
-    // 5xx so Kejue retries (3 attempts w/ exponential backoff).
+    // 5xx so the platform retries (Kejue: 3 attempts; Sonus: 7 over ~31h).
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
