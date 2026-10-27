@@ -558,12 +558,17 @@ function buildDealPayload(opts: {
     });
   }
 
-  // Trade-in (only if the agent extracted enough of the basics).
+  // Trade-in (only if the agent extracted enough of the basics). A seller's car
+  // (KejueSell) goes here too — it's the vehicle the store is appraising, and
+  // has_trade_in alone reads as "trading toward a purchase", which sellers often
+  // aren't.
   const tradeIns: NonNullable<DcDealPayload["deal"]["tradeIns"]> = [];
   const tradeYear = num(structured.trade_year);
   const tradeMake = str(structured.trade_make);
   const tradeModel = str(structured.trade_model);
-  if (bool(structured.has_trade_in) && tradeYear && tradeMake && tradeModel) {
+  const hasAppraisalVehicle =
+    bool(structured.has_trade_in) || distro === "KejueSell";
+  if (hasAppraisalVehicle && tradeYear && tradeMake && tradeModel) {
     const lienholderName = str(structured.trade_lienholder);
     tradeIns.push({
       vehicle: {
