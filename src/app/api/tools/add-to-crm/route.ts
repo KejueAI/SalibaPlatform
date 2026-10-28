@@ -6,14 +6,13 @@
 // attaches a note containing the call summary + a link back to the call log,
 // and optionally schedules an appointment if the agent extracted one.
 //
-// Existing-customer protection: when the caller already exists in DriveCentric
-// we never overwrite their identity fields (name / phone / email) or move the
-// deal's stage — agent-extracted values only fill a field that is *empty* in
-// the CRM. A human-entered name/phone/email always wins over what the agent
-// heard on the call. The note (and additive deal enrichments — vehicle
-// interest, trade-in, activity, appointment) are still attached. Brand-new
-// customers are created with the full extracted profile, since there is
-// nothing to clobber.
+// Existing customers get a note and nothing else: when the caller's phone
+// number is already in DriveCentric we don't upsert a deal (which would
+// reassign the lead's salesperson), touch their profile, or book an
+// appointment — J&S asked for this on 2026-10-28 so a repeat caller stays with
+// the salesperson who already owns them. Any time they asked to come in goes
+// into the note instead. Brand-new customers get the full deal (profile,
+// vehicle interest, trade-in, activity, salesperson) plus note and appointment.
 //
 // Other event types (`call.started`, `call.ended`, campaign.*) are accepted
 // and acknowledged with 204 — we only act on `call.analyzed` so we have the
@@ -649,7 +648,8 @@ function buildNoteDescription(
   call: KejueCallAnalyzedData["call"],
   distro: string | undefined,
   callbackPhone: string | undefined,
-  vehicleHint: string | undefined
+  vehicleHint: string | undefined,
+  appointmentRequest: string | undefined
 ): string {
   const parts: string[] = [];
   if (call.summary) parts.push(call.summary);
@@ -664,6 +664,9 @@ function buildNoteDescription(
   // vehicle-interest (e.g. just "GT3 RS" in interested_stock_id) — surface it
   // rather than dropping it.
   if (vehicleHint) meta.push(`Interested in: ${vehicleHint}`);
+  // Existing customers don't get an appointment booked for them, so the time
+  // they asked for has to be visible on the note.
+  if (appointmentRequest) meta.push(`Requested appointment: ${appointmentRequest}`);
   if (call.outcome_id) meta.push(`Outcome: ${call.outcome_id}`);
   if (typeof call.score === "number") meta.push(`Score: ${call.score}`);
   if (typeof call.duration_seconds === "number") {
@@ -950,33 +953,51 @@ async function syncCallToCrm(
   const existingCustomer = await findExistingCustomer(data.contact, structured);
   const existingCustomerCrmId = existingCustomer?.id ?? null;
 
-  const dealPayload = buildDealPayload({
-    partnerKey,
-    existingCustomer,
-    contact: data.contact,
-    structured,
-    resolvedInterest,
-    callId,
-    callSummary: data.call.summary,
-    callEndedAt,
-    salespersonCrmId: process.env.DRIVECENTRIC_DEFAULT_SALESPERSON_CRM_ID,
-  });
+  // Existing customer → note only (see header). Only a brand-new caller gets a
+  // deal, which is what assigns the default salesperson.
+  let customerId: string;
+  let dealId: string | null = null;
+  if (existingCustomer) {
+    customerId = existingCustomer.id;
+  } else {
+    const dealPayload = buildDealPayload({
+      partnerKey,
+      existingCustomer: null,
+      contact: data.contact,
+      structured,
+      resolvedInterest,
+      callId,
+      callSummary: data.call.summary,
+      callEndedAt,
+      salespersonCrmId: process.env.DRIVECENTRIC_DEFAULT_SALESPERSON_CRM_ID,
+    });
 
-  const upsertResp = await upsertDeal(dealPayload);
+    const upsertResp = await upsertDeal(dealPayload);
 
-  const customerId =
-    findIdentifier(upsertResp.deal?.customers?.[0]?.identifiers, "CrmId") ??
-    existingCustomerCrmId;
-  if (!customerId) {
-    throw new Error(
-      "Deal upsert succeeded but no customer CrmId returned — cannot attach note"
+    const createdId = findIdentifier(
+      upsertResp.deal?.customers?.[0]?.identifiers,
+      "CrmId"
     );
+    if (!createdId) {
+      throw new Error(
+        "Deal upsert succeeded but no customer CrmId returned — cannot attach note"
+      );
+    }
+    customerId = createdId;
+    dealId = findIdentifier(upsertResp.deal?.identifiers, "CrmId");
   }
-  const dealId = findIdentifier(upsertResp.deal?.identifiers, "CrmId");
+
+  const planned = planAppointment(structured);
+  const appointmentRequest =
+    existingCustomer && planned.ok
+      ? `${planned.appointment.type} ${str(structured.appointment_datetime)}`
+      : undefined;
 
   // Note: includes the Kejue call-log URL via the {Url} placeholder.
-  // Don't fail the whole sync if the note leg fails (e.g. a DriveCentric 504) —
-  // the deal is already committed, and we still want to attempt the appointment.
+  // For a new customer, don't fail the whole sync if the note leg fails (e.g. a
+  // DriveCentric 504) — the deal is already committed, and we still want to
+  // attempt the appointment. For an existing customer the note is the only
+  // write, so a failure fails the event and it can be retried.
   let noteId: string | null = null;
   let noteSkippedReason: string | undefined;
   try {
@@ -998,24 +1019,29 @@ async function syncCallToCrm(
         data.call,
         resolveDistro(structured),
         rawCallbackPhone(data.contact, structured),
-        vehicleHint
+        vehicleHint,
+        appointmentRequest
       ),
       url: data.call.log_url ?? callLogUrl(callId),
       pinned: String(structured.lead_quality ?? "").toLowerCase() === "hot",
     });
     noteId = note.noteId;
   } catch (err) {
+    if (existingCustomer) throw err;
     noteSkippedReason = (err as Error).message;
     console.error(
       `[add-to-crm] note creation failed for customer ${customerId}, continuing: ${noteSkippedReason}`
     );
   }
 
-  // Appointment, if the agent flagged one.
+  // Appointment, if the agent flagged one (new customers only).
   let appointmentId: string | null = null;
   let appointmentSkippedReason: string | undefined;
-  const planned = planAppointment(structured);
-  if (planned.ok) {
+  if (existingCustomer) {
+    appointmentSkippedReason = planned.ok
+      ? "existing customer — requested time left in the note"
+      : planned.reason;
+  } else if (planned.ok) {
     console.log(
       `[add-to-crm] appointment: creating ${planned.appointment.type} for customer ${customerId} at ${planned.appointment.appointmentDate}`
     );
