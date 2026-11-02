@@ -260,5 +260,13 @@ export async function POST(request: NextRequest) {
   return NextResponse.json({
     results: shaped,
     total_count: shaped.length,
+    // `description` is vAuto ad copy ("CARFAX One-Owner", "Clean CARFAX") and
+    // carries no title brands or buyback history. On a 2026-10-30 call the
+    // agent read "One-Owner" as "clean history" and argued with a caller
+    // holding a Carfax that showed a branded-title buyback.
+    ...(shaped.length > 0 && {
+      history_note:
+        "The description is advertising text. It does not show title brands, lemon-law buybacks or accident history, so never tell a caller a car has a clean title or clean history. If they say a CARFAX shows a branded title, buyback or damage, believe them, don't argue, and note it for the team to confirm.",
+    }),
   });
 }
