@@ -6,13 +6,30 @@
 // attaches a note containing the call summary + a link back to the call log,
 // and optionally schedules an appointment if the agent extracted one.
 //
-// Existing customers get a note and nothing else: when the caller's phone
-// number is already in DriveCentric we don't upsert a deal (which would
-// reassign the lead's salesperson), touch their profile, or book an
-// appointment — J&S asked for this on 2026-10-28 so a repeat caller stays with
-// the salesperson who already owns them. Any time they asked to come in goes
-// into the note instead. Brand-new customers get the full deal (profile,
+// Existing customers get a note tagging their salesperson, and nothing else:
+// when the caller's phone number is already in DriveCentric we don't upsert a deal
+// (which would reassign the lead's salesperson), touch their profile, or book
+// an appointment — J&S asked for this on 2026-10-28 so a repeat caller stays
+// with the salesperson who already owns them. Any time they asked to come in
+// goes into the note instead. Brand-new customers get the full deal (profile,
 // vehicle interest, trade-in, activity, salesperson) plus note and appointment.
+//
+// An untagged note is silent, though, so nobody at the store learned that a
+// repeat customer had called (J&S, 2026-11-07). Before 2026-10-28 the deal
+// upsert re-stamped the distro source and DriveCentric re-routed the lead,
+// which is what used to notify someone — the same write that reassigned them.
+// So a repeat caller's note now opens with `@{AssociatedSalesperson}`, which
+// DriveCentric resolves to whoever already owns the lead and notifies them,
+// without touching the assignment.
+//
+// The tag is probed before it is used (tagSalespersonIfAny): a token nobody
+// holds is *accepted* and stored as literal "@{...}" text rather than
+// rejected, and notes can't be edited or deleted through this API, so a tag
+// sent blindly would disfigure the record permanently. When the probe says
+// nobody is assigned the note goes out untagged and we fall back to the
+// distro-routed deal upsert — the pre-2026-10-28 mechanism, now scoped to
+// exactly the case J&S's rule doesn't cover, where there is nobody to
+// displace.
 //
 // Other event types (`call.started`, `call.ended`, campaign.*) are accepted
 // and acknowledged with 204 — we only act on `call.analyzed` so we have the
@@ -34,9 +51,12 @@ import { verifyKejueWebhook, verifySonusWebhook } from "@/lib/webhook-verify";
 import {
   createAppointment,
   createNote,
+  DcNoUserToTagError,
   findIdentifier,
   getStore,
+  SALESPERSON_TAG,
   searchCustomers,
+  tagSalespersonIfAny,
   upsertDeal,
   type DcAppointmentType,
   type DcCustomerSummary,
@@ -649,7 +669,13 @@ function buildNoteDescription(
   distro: string | undefined,
   callbackPhone: string | undefined,
   vehicleHint: string | undefined,
-  appointmentRequest: string | undefined
+  appointmentRequest: string | undefined,
+  // Tags the lead's salesperson so DriveCentric notifies them. Kept out of the
+  // truncation below so a long summary can never cut the tag off and silence
+  // the note. Rendered bold to match a hand-typed mention — DriveCentric
+  // stores the <b> we send, and a tag that doesn't look like the ones people
+  // type gets read as ordinary text.
+  tag?: string
 ): string {
   const parts: string[] = [];
   if (call.summary) parts.push(call.summary);
@@ -676,7 +702,11 @@ function buildNoteDescription(
 
   parts.push("Call log: {Url}");
 
-  return truncate(parts.filter(Boolean).join("\n\n"), NOTE_MAX_LEN) ?? "{Url}";
+  const prefix = tag ? `<b>${tag}</b> ` : "";
+  const body =
+    truncate(parts.filter(Boolean).join("\n\n"), NOTE_MAX_LEN - prefix.length) ??
+    "{Url}";
+  return `${prefix}${body}`;
 }
 
 interface PlannedAppointment {
@@ -906,6 +936,9 @@ interface SyncResult {
   dealId: string | null;
   noteId: string | null;
   noteSkippedReason?: string;
+  // Whether the note tagged the lead's salesperson (existing customers only).
+  salespersonTagged: boolean;
+  tagSkippedReason?: string;
   appointmentId: string | null;
   matchedStockId: string | null;
   newCustomer: boolean;
@@ -1000,6 +1033,10 @@ async function syncCallToCrm(
   // write, so a failure fails the event and it can be retried.
   let noteId: string | null = null;
   let noteSkippedReason: string | undefined;
+  // Whether the note tagged the lead's salesperson, and why not when it didn't
+  // — surfaced on /dashboard/events so a silent regression is visible.
+  let salespersonTagged = false;
+  let tagSkippedReason: string | undefined;
   try {
     // Vehicle info that resolveVehicleInterest couldn't turn into a deal
     // vehicle (missing year/make/model) still matters to the sales team.
@@ -1014,18 +1051,83 @@ async function syncCallToCrm(
           .filter(Boolean)
           .join(" ") || undefined;
 
-    const note = await createNote(customerId, {
+    const noteBody = (tag?: string) => ({
       description: buildNoteDescription(
         data.call,
         resolveDistro(structured),
         rawCallbackPhone(data.contact, structured),
         vehicleHint,
-        appointmentRequest
+        appointmentRequest,
+        tag
       ),
       url: data.call.log_url ?? callLogUrl(callId),
       pinned: String(structured.lead_quality ?? "").toLowerCase() === "hot",
     });
-    noteId = note.noteId;
+
+    // Only a repeat caller's note is tagged. A brand-new caller's deal upsert
+    // is itself what routes and announces the lead, and at that moment there
+    // is no owner to tag yet.
+    if (!existingCustomer) {
+      noteId = (await createNote(customerId, noteBody())).noteId;
+    } else {
+      // Probe first — and the probe is itself the notification when it lands.
+      // `null` means we couldn't find out (a transient DriveCentric error):
+      // write the note untagged, but don't touch the deal, since routing by
+      // distro is only safe when we know nobody is assigned.
+      let tagged: boolean | null = null;
+      try {
+        tagged = await tagSalespersonIfAny(customerId, {
+          description: `${SALESPERSON_TAG} Your customer just called in — see the call note.`,
+          url: data.call.log_url ?? callLogUrl(callId),
+        });
+      } catch (probeErr) {
+        tagSkippedReason = `could not reach the salesperson tag: ${(probeErr as Error).message}`;
+        console.error(`[add-to-crm] note: ${tagSkippedReason}`);
+      }
+
+      try {
+        noteId = (await createNote(customerId, noteBody(tagged ? SALESPERSON_TAG : undefined))).noteId;
+        salespersonTagged = tagged === true;
+      } catch (err) {
+        // The salesperson came off the lead between the probe and the note.
+        if (!(err instanceof DcNoUserToTagError)) throw err;
+        console.log(
+          `[add-to-crm] note: tag stopped resolving for customer ${customerId} — rewriting untagged`
+        );
+        noteId = (await createNote(customerId, noteBody())).noteId;
+        tagged = false;
+      }
+
+      // Nobody owns this lead, so nobody can be tagged — and nobody can be
+      // displaced either. Route it by distro the way a new lead is routed
+      // (buyers → Internet, sellers → Campaign). Identity fields stay
+      // protected: buildDealPayload keeps the customer's stored
+      // name/phone/email and omits `stage`.
+      if (tagged === false) {
+        try {
+          const upsertResp = await upsertDeal(
+            buildDealPayload({
+              partnerKey,
+              existingCustomer,
+              contact: data.contact,
+              structured,
+              resolvedInterest,
+              callId,
+              callSummary: data.call.summary,
+              callEndedAt,
+              salespersonCrmId:
+                process.env.DRIVECENTRIC_DEFAULT_SALESPERSON_CRM_ID,
+            })
+          );
+          dealId = findIdentifier(upsertResp.deal?.identifiers, "CrmId");
+          tagSkippedReason =
+            "no salesperson on the lead — routed by distro instead";
+        } catch (upsertErr) {
+          tagSkippedReason = `no salesperson on the lead, and distro routing failed: ${(upsertErr as Error).message}`;
+          console.error(`[add-to-crm] note: ${tagSkippedReason}`);
+        }
+      }
+    }
   } catch (err) {
     if (existingCustomer) throw err;
     noteSkippedReason = (err as Error).message;
@@ -1093,6 +1195,8 @@ async function syncCallToCrm(
     dealId,
     noteId,
     noteSkippedReason,
+    salespersonTagged,
+    tagSkippedReason,
     appointmentId,
     matchedStockId,
     newCustomer: !existingCustomerCrmId,
@@ -1264,6 +1368,8 @@ export async function POST(request: NextRequest) {
           deal_id: result.dealId,
           note_id: result.noteId,
           note_skipped_reason: result.noteSkippedReason ?? null,
+          salesperson_tagged: result.salespersonTagged,
+          tag_skipped_reason: result.tagSkippedReason ?? null,
           appointment_id: result.appointmentId,
           matched_stock_id: result.matchedStockId,
           new_customer: result.newCustomer,

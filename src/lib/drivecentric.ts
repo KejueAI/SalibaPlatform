@@ -314,14 +314,134 @@ export async function createNote(
   );
   if (!res.ok) {
     const body = await readErrorBody(res);
+    if (res.status === 400 && NO_USER_RESOLVED.test(body)) {
+      console.log(
+        `[drivecentric] create note: no salesperson to tag on customer ${customerId}`
+      );
+      throw new DcNoUserToTagError(
+        `DriveCentric createNote resolved no user to tag: ${body}`
+      );
+    }
     console.error(`[drivecentric] create note: failed (${res.status}) — ${body}`);
     throw new Error(
       `DriveCentric createNote failed (${res.status}): ${body}`
     );
   }
   const created = (await res.json()) as DcCreateNoteResponse;
+  // A tag that resolved to nobody comes back as literal "@{...}" text on an
+  // otherwise successful write (see tagResolved). The caller asked for a tag
+  // it believed would resolve, so tell it to rewrite the note without one.
+  if (tagSurvived(note.description, created.description)) {
+    throw new DcNoUserToTagError(
+      `DriveCentric createNote stored an unresolved tag on note ${created.noteId}`
+    );
+  }
   console.log(`[drivecentric] create note: created noteId=${created.noteId}`);
   return created;
+}
+
+// ─── Salesperson tagging ─────────────────────────────────────────────────────
+
+// DriveCentric notifies a user when a note *tags* them. In the UI you type
+// "@Name"; over the API you write `@{<PartnerUserType>}` and the server
+// resolves it against the customer's deal before storing — we send
+// `@{AssociatedSalesperson}` and DriveCentric stores "@Justin Drzal". So we
+// never need to know (or store) who the salesperson is, and unlike a deal
+// upsert, tagging does not change who the lead is assigned to. Wrap it in <b>
+// to match a hand-typed mention, which renders bold.
+//
+// `AssociatedSalesperson` / `AssociatedSalesperson2` are the only tokens that
+// resolve. A specific user cannot be targeted — raw user ids, names and emails
+// are all rejected — so there is no way to tag a manager or a desk.
+export const SALESPERSON_TAG = "@{AssociatedSalesperson}";
+
+// The trap: when nobody holds the role, the write is **accepted** (200) and
+// the raw token is stored as literal text — DriveCentric does not reject it.
+// Since notes can be neither edited nor deleted through this API, a tag sent
+// blindly can leave "@{AssociatedSalesperson}" sitting in a note forever. So
+// resolution is detected by reading the stored description back, and the tag
+// only goes on a note once we know it resolves.
+//
+// Compare against the exact token we sent, never a loose "@{" search: a note
+// also carries the agent's call summary, and a transcript that happened to
+// contain those two characters would otherwise read as "nobody is assigned" —
+// a verdict that sends the caller through distro routing and reassigns the
+// salesperson who does own them.
+function tagSurvived(
+  sentDescription: string,
+  storedDescription: string | null | undefined
+): boolean {
+  const tag = sentDescription.match(/@\{[A-Za-z0-9_]+\}/)?.[0];
+  if (!tag) return false; // nothing was tagged in the first place
+  return !!storedDescription && storedDescription.includes(tag);
+}
+
+// Thrown when a tag resolved to nobody on a write that we expected to resolve
+// (a salesperson removed between the probe and the note). Callers retry the
+// write untagged.
+export class DcNoUserToTagError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DcNoUserToTagError";
+  }
+}
+
+const NO_USER_RESOLVED = /At least 1 user must be specified in the description/i;
+
+// Tags the lead's salesperson, and reports whether there was one to tag.
+//
+// Implemented against the `mention` endpoint on purpose: it takes the same
+// token but what it creates never appears on the customer's timeline, so when
+// the token resolves to nobody we find that out without leaving a visible note
+// full of raw `@{...}`. When it does resolve, this is also the notification —
+// the caller then puts the same tag on the real note.
+// Returns true when a salesperson was tagged, false when the lead has none,
+// and null when DriveCentric's answer doesn't say — the caller must then leave
+// the note untagged and leave the deal alone, since both tagging and distro
+// routing need a verdict we trust.
+export async function tagSalespersonIfAny(
+  customerId: string,
+  mention: { description: string; pinned?: boolean; url?: string }
+): Promise<boolean | null> {
+  console.log(`[drivecentric] tag salesperson: customer ${customerId}`);
+  const res = await dcFetch(
+    `/api/stores/${STORE_ID}/customers/${customerId}/mention`,
+    { method: "POST", body: mention }
+  );
+  if (!res.ok) {
+    const body = await readErrorBody(res);
+    // No parseable user in the description at all — same conclusion: nobody
+    // was tagged. Nothing was written in this case.
+    if (res.status === 400 && NO_USER_RESOLVED.test(body)) {
+      console.log(
+        `[drivecentric] tag salesperson: nobody to tag on customer ${customerId}`
+      );
+      return false;
+    }
+    console.error(
+      `[drivecentric] tag salesperson: failed (${res.status}) — ${body}`
+    );
+    throw new Error(
+      `DriveCentric tagSalespersonIfAny failed (${res.status}): ${body}`
+    );
+  }
+  const created = (await res.json()) as { description?: string | null };
+  // No echoed text means we can't tell whether the tag resolved. Don't guess:
+  // guessing "resolved" puts an unremovable raw token on the customer's note,
+  // and guessing "unassigned" reassigns a salesperson who may well exist.
+  if (!created.description) {
+    console.warn(
+      `[drivecentric] tag salesperson: customer ${customerId} returned no description — cannot tell`
+    );
+    return null;
+  }
+  const resolved = !tagSurvived(mention.description, created.description);
+  console.log(
+    `[drivecentric] tag salesperson: customer ${customerId} -> ${
+      resolved ? "tagged " + created.description?.slice(0, 40) : "nobody assigned"
+    }`
+  );
+  return resolved;
 }
 
 // ─── Appointments ────────────────────────────────────────────────────────────
