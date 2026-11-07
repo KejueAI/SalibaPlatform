@@ -347,8 +347,9 @@ export async function createNote(
 // resolves it against the customer's deal before storing — we send
 // `@{AssociatedSalesperson}` and DriveCentric stores "@Justin Drzal". So we
 // never need to know (or store) who the salesperson is, and unlike a deal
-// upsert, tagging does not change who the lead is assigned to. Wrap it in <b>
-// to match a hand-typed mention, which renders bold.
+// upsert, tagging does not change who the lead is assigned to. Send the token
+// bare — the note body is not rendered as HTML, so markup wrapped around the
+// tag shows up as literal <b> on the customer's timeline.
 //
 // `AssociatedSalesperson` / `AssociatedSalesperson2` are the only tokens that
 // resolve. A specific user cannot be targeted — raw user ids, names and emails

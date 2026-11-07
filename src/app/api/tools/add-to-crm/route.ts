@@ -222,6 +222,16 @@ function callLogUrl(callId: string): string {
   return `https://app.kejue.co/logs?call=${encodeURIComponent(callId)}`;
 }
 
+// A note's description is stored as HTML but displayed escaped, so anything
+// tag-shaped in it shows up as literal markup on the customer's timeline —
+// including the markup DriveCentric itself injects. Its linkifier only fires
+// on a scheme, so dropping `https://` is what keeps a URL readable: verified
+// 2026-11-07 that `app.kejue.co/...` comes back untouched while the same URL
+// with its scheme comes back wrapped in `<u><a href=...>`.
+function bareUrl(url: string): string {
+  return url.replace(/^https?:\/\//, "");
+}
+
 // DriveCentric's Customer Phones validator only accepts 10 raw digits
 // (`xxxxxxxxxx`) — Kejue often sends E.164 (`+15551234567`) or the agent may
 // extract a formatted phone_number. Strip everything non-numeric and keep the
@@ -670,11 +680,14 @@ function buildNoteDescription(
   callbackPhone: string | undefined,
   vehicleHint: string | undefined,
   appointmentRequest: string | undefined,
+  // Written into the note as text rather than via DriveCentric's `{Url}`
+  // placeholder: that placeholder expands to an anchor tag the timeline then
+  // shows as raw markup. See bareUrl.
+  logUrl: string,
   // Tags the lead's salesperson so DriveCentric notifies them. Kept out of the
   // truncation below so a long summary can never cut the tag off and silence
-  // the note. Rendered bold to match a hand-typed mention — DriveCentric
-  // stores the <b> we send, and a tag that doesn't look like the ones people
-  // type gets read as ordinary text.
+  // the note. Sent as bare text: the note body is not rendered as HTML, so any
+  // markup around the tag shows up as literal <b> on the customer's timeline.
   tag?: string
 ): string {
   const parts: string[] = [];
@@ -700,12 +713,13 @@ function buildNoteDescription(
   }
   if (meta.length > 0) parts.push(meta.join(" · "));
 
-  parts.push("Call log: {Url}");
+  const link = bareUrl(logUrl);
+  parts.push(`Call log: ${link}`);
 
-  const prefix = tag ? `<b>${tag}</b> ` : "";
+  const prefix = tag ? `${tag} ` : "";
   const body =
     truncate(parts.filter(Boolean).join("\n\n"), NOTE_MAX_LEN - prefix.length) ??
-    "{Url}";
+    link;
   return `${prefix}${body}`;
 }
 
@@ -1051,6 +1065,7 @@ async function syncCallToCrm(
           .filter(Boolean)
           .join(" ") || undefined;
 
+    const logUrl = data.call.log_url ?? callLogUrl(callId);
     const noteBody = (tag?: string) => ({
       description: buildNoteDescription(
         data.call,
@@ -1058,9 +1073,12 @@ async function syncCallToCrm(
         rawCallbackPhone(data.contact, structured),
         vehicleHint,
         appointmentRequest,
+        logUrl,
         tag
       ),
-      url: data.call.log_url ?? callLogUrl(callId),
+      // Still sent: it is the documented home for a note's link, and it no
+      // longer feeds the description now that `{Url}` is gone from it.
+      url: logUrl,
       pinned: String(structured.lead_quality ?? "").toLowerCase() === "hot",
     });
 
